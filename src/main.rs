@@ -128,7 +128,11 @@ impl Database
                     monthly_sum = chrono::Duration::seconds(0);
                 }
             }
-            println!(" Start: {} End: {} ({}) // {:#?}", entry.start.format("%Y-%m-%d %T"), entry.end.format("%T"), format_chrono_duration(&duration), entry.comments );
+            if let Some(previous_entry) = previous_entry
+            {
+                println!("  Pause: {}", format_chrono_duration(&(entry.start - previous_entry.end) ));
+            }
+            println!(" Start: {} End: {} ({}) {:#?}", entry.start.format("%Y-%m-%d %T"), entry.end.format("%T"), format_chrono_duration(&duration), entry.comments );
             previous_entry = Some(entry);
         }
         
@@ -151,7 +155,7 @@ struct ActivityRecorder
     database: Arc<Mutex<Database>>,
     last_event_time : chrono::DateTime< chrono::offset::Local>,
     last_start_time : chrono::DateTime< chrono::offset::Local>,
-    comments: Vec<String>
+    comments: String
 }
 
 impl ActivityRecorder
@@ -159,7 +163,7 @@ impl ActivityRecorder
     fn new(database : Arc<Mutex<Database>>) -> Self
     {
         let now = std::time::SystemTime::now().into();
-        ActivityRecorder { database: database, last_event_time: now, last_start_time: now, comments: Vec::new() }
+        ActivityRecorder { database: database, last_event_time: now, last_start_time: now, comments: "".into() }
     }
 
     fn handle_event(self: &mut Self, event: EventType)
@@ -172,7 +176,7 @@ impl ActivityRecorder
                 let time_since_last_activity = event_time - self.last_event_time;
                 if time_since_last_activity > chrono::Duration::seconds(10)
                 {
-                    self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: "z,z".into() });
+                    self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
                     self.last_start_time = event_time;
                     self.comments.clear();
                 }
@@ -180,11 +184,11 @@ impl ActivityRecorder
             }
             EventType::Comment(comment) =>
             {
-                self.comments.push(comment);
+                self.comments.push_str(&comment);
             }
             EventType::Commit =>
             {
-                self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: "z,z".into() });
+                self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
                 //self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
             }
         }
