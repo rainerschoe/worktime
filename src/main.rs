@@ -1,9 +1,11 @@
 use std::time::SystemTime;
 use std::error::Error;
 
-use chrono::Datelike;
+use chrono::{Datelike, DateTime};
 use rdev::{listen, Event};
 use std::sync::*;
+use std::thread;
+use chrono::Timelike;
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
@@ -49,6 +51,15 @@ struct Database
 
 impl Database 
 {
+    /// if last element in database hase same start time it is overwritten. otherwise new element is pushed
+    fn commit_worktime(self : &mut Self, entry: WorktimeEntry)
+    {
+        if self.rows.len() > 0 && self.rows[self.rows.len()-1].start == entry.start
+        {
+            self.rows.pop();
+        }
+        self.rows.push(entry);
+    }
 
     fn load_file_and_append(self: &mut Self, path: String) -> Result<(), Box<dyn Error>>
     {
@@ -76,13 +87,34 @@ impl Database
 
     fn print_summary(self: &Self, first: chrono::DateTime<chrono::offset::Local>, second: chrono::DateTime<chrono::offset::Local>, partial_entry: Option<chrono::DateTime<chrono::offset::Local>>)
     {
+
+        //let mut outside_ref : Option<& i64>= None;
+
+        //let mut closure =  |inside_ref: & i64|
+        //{
+        //    outside_ref = Some(inside_ref);
+        //};
+
+        //let i = 8;
+        //let i_ref : & i64 = &i;
+
+        //closure(i_ref);
+
         let mut previous_entry : Option<&WorktimeEntry> = None;
         let mut daily_sum   = chrono::Duration::days(0);
         let mut weekly_sum  = chrono::Duration::days(0);
         let mut monthly_sum = chrono::Duration::days(0);
         let mut total_sum   = chrono::Duration::days(0);
 
-        let element_op = |entry: &WorktimeEntry|
+        let iter_rows = self.rows.iter().filter(|x| {x.start >= first && x.end <= second} );
+        let mut partial_entry_vec: Vec<WorktimeEntry> = Vec::new();
+        if let Some(partial_start) = partial_entry
+        {
+            partial_entry_vec.push(WorktimeEntry { start: partial_start, end: std::time::SystemTime::now().into() , comments: vec!["...ongoing".into()] });
+        }
+        let combined_iter = iter_rows.chain(partial_entry_vec.iter());
+
+        for entry in combined_iter
         {
             let duration = entry.end - entry.start;
 
@@ -113,17 +145,8 @@ impl Database
                     monthly_sum = chrono::Duration::seconds(0);
                 }
             }
-            println!(" Start: {} End: {} ({}) // {}", entry.start.format("%Y-%m-%d %T"), entry.end.format("%T"), format_chrono_duration(&duration), entry.comments );
+            println!(" Start: {} End: {} ({}) // {:#?}", entry.start.format("%Y-%m-%d %T"), entry.end.format("%T"), format_chrono_duration(&duration), entry.comments );
             previous_entry = Some(entry);
-        };
-
-        for entry in self.rows.iter().filter(|x| {x.start >= first && x.end <= second} )
-        {
-            element_op(entry);
-        }
-        if let Some(partial_start) = partial_entry
-        {
-            element_op(&WorktimeEntry { start: partial_start, end: std::time::SystemTime::now().into() , comments: vec!["...ongoing".into()] });
         }
     }
 }
@@ -133,7 +156,7 @@ enum EventType
 {
     Activity(Event),
     Comment(String),
-    Terminate
+    Commit
 }
 
 struct ActivityRecorder
@@ -146,7 +169,13 @@ struct ActivityRecorder
 
 impl ActivityRecorder
 {
-    fn handle_event(self: &Self, event: EventType)
+    fn new(database : Arc<Mutex<Database>>) -> Self
+    {
+        let now = std::time::SystemTime::now().into();
+        ActivityRecorder { database: database, last_event_time: now, last_start_time: now, comments: Vec::new() }
+    }
+
+    fn handle_event(self: &mut Self, event: EventType)
     {
         match event
         {
@@ -156,7 +185,7 @@ impl ActivityRecorder
                 let time_since_last_activity = event_time - self.last_event_time;
                 if time_since_last_activity > chrono::Duration::seconds(10)
                 {
-                    self.database.lock().unwrap().rows.push(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments });
+                    self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
                     //let worked_time = self.last_start_time - self.last_event_time;
                     //println!(" Worked: {}", format_duration(&worked_time));
                     //println!("Stopped working at {}", format_time(& self.last_event_time));
@@ -171,77 +200,39 @@ impl ActivityRecorder
             {
                 self.comments.push(comment);
             }
-            EventType::Terminate =>
+            EventType::Commit =>
             {
-                self.database.lock().unwrap().rows.push(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments });
-                self.comments.clear();
-                let now = std::time::SystemTime::now().into();
-                self.last_event_time = now;
-                self.last_start_time = now;
+                self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
             }
         }
     }
-}
-
-//  2023-01-09 22:38:44; 2023-01-09 22:39:01; Comments
-
-fn callback(event: Event, store: &mut Store) {
-    if let Ok(time_since_last_activity) = event.time.duration_since(store.last_event_time)
-    {
-        if time_since_last_activity > std::time::Duration::from_secs(10)
-        //if time_since_last_activity > std::time::Duration::from_secs(10*60)
-        {
-            if let Ok(worked_time) = store.last_event_time.duration_since(store.last_start_time)
-            {
-                println!(" Worked: {}", format_duration(&worked_time));
-            }
-            else 
-            {
-                println!(" Worked: 0h0m0s");
-            }
-            println!("Stopped working at {}", format_time(& store.last_event_time));
-            println!(" Pause: {}", format_duration(&time_since_last_activity));
-            println!("Started working at {}", format_time(& event.time));
-            store.last_start_time = event.time;
-        }
-    }
-    store.last_event_time = event.time;
-    //println!("My callback {:?}", event);
- //   match event.name {
- //       Some(string) => println!("User wrote {:?}", string),
- //       None => (),
- //   }
-}
-
-struct Store
-{
-    last_event_time : SystemTime,
-    last_start_time : SystemTime
 }
 
 fn main() {
     println!("Hello, world!");
     println!("Started working at {}", format_time(&SystemTime::now()));
 
-    let mut store = Store{
-        last_event_time: SystemTime::now(),
-        last_start_time: SystemTime::now()
-    };
+    let database = Arc::new(Mutex::new(Database::default()));
+    let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(database.clone())));
 
     // monitor signals:
-    let mut signals = Signals::new(&[SIGINT])?;
+    let activity_recorder_signals = activity_recorder.clone();
     thread::spawn(move || {
+        let mut signals = Signals::new(&[SIGINT]).unwrap();
         for sig in signals.forever() {
             println!("Received signal {:?}", sig);
+            activity_recorder_signals.lock().unwrap().handle_event(EventType::Commit);
+            std::process::exit(0);
         }
     });
 
     // monitor mouse/key events:
+    let activity_recorder_activity = activity_recorder.clone();
     thread::spawn(move || {
         if let Err(error) = listen(move
             |event|
             {
-            callback(event, &mut store)
+            activity_recorder_activity.lock().unwrap().handle_event(EventType::Activity(event));
             }
         ) {
             println!("Error: {:?}", error)
@@ -252,6 +243,14 @@ fn main() {
     // TODO
     loop
     {
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(std::time::Duration::from_secs(2));
+        //thread::sleep(chrono::Duration::seconds(2));
+        let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+        let day_start = now.with_hour(0).unwrap().with_minute(0).unwrap();
+        let day_end = now.with_hour(23).unwrap().with_minute(59).unwrap();
+        //.with_seconds(0).with_nanoseconds(0);
+        activity_recorder.lock().unwrap().handle_event(EventType::Commit);
+        println!("---");
+        database.lock().unwrap().print_summary(day_start, day_end, None);
     }
 }
