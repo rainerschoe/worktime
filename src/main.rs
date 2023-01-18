@@ -9,6 +9,18 @@ use chrono::Timelike;
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
+use serde::{Serialize,Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    timeout_minutes: u64,
+    data_file: String
+}
+
+impl ::std::default::Default for Config {
+    fn default() -> Self { Self { timeout_minutes: 10, data_file: "/home/rschoe/worktime.csv".into() } }
+}
+
 fn format_time(time: &SystemTime) -> String
 {
     let datetime:  chrono::DateTime< chrono::offset::Local> = (*time).into();
@@ -155,15 +167,16 @@ struct ActivityRecorder
     database: Arc<Mutex<Database>>,
     last_event_time : chrono::DateTime< chrono::offset::Local>,
     last_start_time : chrono::DateTime< chrono::offset::Local>,
-    comments: String
+    comments: String,
+    timeouts_minutes: u64
 }
 
 impl ActivityRecorder
 {
-    fn new(database : Arc<Mutex<Database>>) -> Self
+    fn new(database : Arc<Mutex<Database>>, timeout_minutes: u64) -> Self
     {
         let now = std::time::SystemTime::now().into();
-        ActivityRecorder { database: database, last_event_time: now, last_start_time: now, comments: "".into() }
+        ActivityRecorder { database: database, last_event_time: now, last_start_time: now, comments: "".into(), timeouts_minutes: timeout_minutes }
     }
 
     fn handle_event(self: &mut Self, event: EventType)
@@ -174,7 +187,7 @@ impl ActivityRecorder
             {
                 let event_time : chrono::DateTime<chrono::offset::Local> = event.time.into();
                 let time_since_last_activity = event_time - self.last_event_time;
-                if time_since_last_activity > chrono::Duration::seconds(10)
+                if time_since_last_activity > chrono::Duration::minutes(self.timeouts_minutes as i64)
                 {
                     self.database.lock().unwrap().commit_worktime(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments.clone() });
                     self.last_start_time = event_time;
@@ -197,13 +210,22 @@ impl ActivityRecorder
 
 fn main() {
     println!("Hello, world!");
-    println!("Started working at {}", format_time(&SystemTime::now()));
+    let cfg : Config = confy::load("worktime", None).unwrap();
+
 
     let database = Arc::new(Mutex::new(Database::default()));
 
-    database.lock().unwrap().load_file_and_append("/home/rschoe/worktime.csv".into()).unwrap();
+    //let data_path = shellexpand::tilde("~/worktime.csv");
+    //let data_path = shellexpand::tilde(cfg.data_file.as_str());
+    let data_path = cfg.data_file; // FIXME: can not get shellexpand to work with String.
 
-    let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(database.clone())));
+    if let Err(_) = 
+    database.lock().unwrap().load_file_and_append(data_path.clone().into())
+    {
+        println!("Note: Data file {} could not be loaded. Not retrieving any historic worktime data...", data_path);
+    }
+
+    let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(database.clone(), cfg.timeout_minutes)));
 
     // monitor signals:
     let activity_recorder_signals = activity_recorder.clone();
@@ -213,7 +235,7 @@ fn main() {
         for sig in signals.forever() {
             println!("Received signal {:?}", sig);
             activity_recorder_signals.lock().unwrap().handle_event(EventType::Commit);
-            database_signals.lock().unwrap().store_file("/home/rschoe/worktime.csv".into()).unwrap();
+            database_signals.lock().unwrap().store_file(data_path.clone().into()).unwrap();
             std::process::exit(0);
         }
     });
