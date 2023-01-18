@@ -10,3 +10,4 @@ rdev = "0.5" # system libs required: libXi-devel libX11-devel libXtst-devel
 chrono = {version = "0.4", features = ["serde"]}
 csv = "1.1"
 serde = { version = "1", features = ["derive"] }
+signal_hook = { version = "0.3"}

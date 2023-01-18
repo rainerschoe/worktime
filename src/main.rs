@@ -3,6 +3,9 @@ use std::error::Error;
 
 use chrono::Datelike;
 use rdev::{listen, Event};
+use std::sync::*;
+
+use signal_hook::{consts::SIGINT, iterator::Signals};
 
 fn format_time(time: &SystemTime) -> String
 {
@@ -38,6 +41,7 @@ struct WorktimeEntry
     comments: Vec<String>,
 }
 
+#[derive(Default)]
 struct Database
 {
     rows: Vec<WorktimeEntry>,
@@ -124,6 +128,61 @@ impl Database
     }
 }
 
+
+enum EventType
+{
+    Activity(Event),
+    Comment(String),
+    Terminate
+}
+
+struct ActivityRecorder
+{
+    database: Arc<Mutex<Database>>,
+    last_event_time : chrono::DateTime< chrono::offset::Local>,
+    last_start_time : chrono::DateTime< chrono::offset::Local>,
+    comments: Vec<String>
+}
+
+impl ActivityRecorder
+{
+    fn handle_event(self: &Self, event: EventType)
+    {
+        match event
+        {
+            EventType::Activity(event) =>
+            {
+                let event_time : chrono::DateTime<chrono::offset::Local> = event.time.into();
+                let time_since_last_activity = event_time - self.last_event_time;
+                if time_since_last_activity > chrono::Duration::seconds(10)
+                {
+                    self.database.lock().unwrap().rows.push(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments });
+                    //let worked_time = self.last_start_time - self.last_event_time;
+                    //println!(" Worked: {}", format_duration(&worked_time));
+                    //println!("Stopped working at {}", format_time(& self.last_event_time));
+                    //println!(" Pause: {}", format_duration(&time_since_last_activity));
+                    //println!("Started working at {}", format_time(& event.time));
+                    self.last_start_time = event_time;
+                    self.comments.clear();
+                }
+                self.last_event_time = event_time;
+            }
+            EventType::Comment(comment) =>
+            {
+                self.comments.push(comment);
+            }
+            EventType::Terminate =>
+            {
+                self.database.lock().unwrap().rows.push(WorktimeEntry { start: self.last_start_time, end: self.last_event_time, comments: self.comments });
+                self.comments.clear();
+                let now = std::time::SystemTime::now().into();
+                self.last_event_time = now;
+                self.last_start_time = now;
+            }
+        }
+    }
+}
+
 //  2023-01-09 22:38:44; 2023-01-09 22:39:01; Comments
 
 fn callback(event: Event, store: &mut Store) {
@@ -138,7 +197,6 @@ fn callback(event: Event, store: &mut Store) {
             }
             else 
             {
-
                 println!(" Worked: 0h0m0s");
             }
             println!("Stopped working at {}", format_time(& store.last_event_time));
@@ -164,17 +222,36 @@ struct Store
 fn main() {
     println!("Hello, world!");
     println!("Started working at {}", format_time(&SystemTime::now()));
-    // This will block.
+
     let mut store = Store{
         last_event_time: SystemTime::now(),
         last_start_time: SystemTime::now()
     };
-    if let Err(error) = listen(move
-        |event|
-        {
-        callback(event, &mut store)
+
+    // monitor signals:
+    let mut signals = Signals::new(&[SIGINT])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            println!("Received signal {:?}", sig);
         }
-    ) {
-        println!("Error: {:?}", error)
+    });
+
+    // monitor mouse/key events:
+    thread::spawn(move || {
+        if let Err(error) = listen(move
+            |event|
+            {
+            callback(event, &mut store)
+            }
+        ) {
+            println!("Error: {:?}", error)
+        }
+    });
+
+    // monitor terminal input:
+    // TODO
+    loop
+    {
+        thread::sleep(Duration::from_secs(2));
     }
 }
