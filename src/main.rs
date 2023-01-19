@@ -10,6 +10,8 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 
 use serde::{Deserialize, Serialize};
 
+// TODO: file lock: prevent multiple workday instances running on same data store file
+
 #[derive(Serialize, Deserialize)]
 struct Config {
     timeout_minutes: u64,
