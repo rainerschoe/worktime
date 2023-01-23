@@ -16,6 +16,25 @@ A work pause is detected as follows:
 3. Classification is done as soon as mouse/keyboard activity is detected again after idle time
 4. A new worktime entry is started after every pause
 
+#### Example:
+Times when keyboard/mouse activity was recognized:
+```
+10:00:00
+10:00:01
+10:00:02
+10:05:00
+10:15:01
+10:15:02
+10:15:03
+10:18:01
+```
+Will lead to the following classification (timeout_minutes=10):
+```
+10:00:00 ... 10:05:00 (5 minutes working)
+    Pause (10min 1s)
+10:15:01 ... 10:18:01 (3 minutes working)
+```
+
 ### User interface
 
 #### Reading worktime:
