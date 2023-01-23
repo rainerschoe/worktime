@@ -2,7 +2,26 @@
 ## Summary
 A simple worktime tracker.
 
-It automatically  records your work time based on mouse/keyboard activity.
+It automatically records your work time based on mouse/keyboard activity.
+
+## Concept
+
+### Automatic activity monitoring
+A work pause is detected as follows:
+
+1. Keyboard/Mouse activity is monitored
+2. Periods of mouse/keyboard inactivity are classified as
+    - Worktime if they are shorter than `timeout_minutes` (default=10).
+    - Pause if they are longer
+3. Classification is done as soon as mouse/keyboard activity is detected again after idle time
+4. A new worktime entry is started after every pause
+
+### User interface
+
+#### Reading worktime:
+The data storage is kept in memory and provides filtering/formatting functions.
+
+Currently the only implemented output is to print a summary of the current day:
 
 Example user output:
 ```
@@ -14,7 +33,33 @@ Example user output:
 Current: Day: 3h30m10s, Week: 3h30m10s, Month: 3h30m1
 ```
 
-The data is stored in a csv-based database:
+This is periodically printed to stdout when the tool is running.
+
+I plan to implement a better frontend as soon as I have some more time... I am also happy to accept PRs ;)
+
+#### Editing worktime:
+The tool mostly manages data capture automatically. The idea is to avoid heavy manual editing of worktime. If you want to do this, this tool might not be what you are looking for.
+
+However there is some control over worktime entries:
+
+- Quitting the program ("Ctrl"+"c") will finish the current work block, and store the entry to file (thus causing a pause)
+- Commenting a worktime entry will be supported in the future.
+- You might want to write/use external software to bulk-edit the data storage file directly (e.g. legalizing worktime).
+
+### Data storage
+A Worktime entry is the fundamental storage unit. It consists of:
+
+- start time/date (Local time)
+- end time/date (Local time)
+- comments (One string only, due to limitations of CSV)
+
+The data store maintains a list of Worktime entries (currently serialized as CSV).
+
+If a working block is not yet finished, it will be stored as a worktime entry anyways, with the current date/time as end.
+On next save, it will be overwritten:
+The start time/date is used as index into the data store. Adding an entry with the same start time/date as the last one will overwrite it.
+
+The data is stored in a csv-based database, which looks like this:
 ```
 2023-01-23T08:39:43.411602735+01:00,2023-01-23T10:52:18.508372583+01:00,"Meetings, Some coding"
 2023-01-23T11:12:21.348136902+01:00,2023-01-23T12:17:40.865009498+01:00,"Read about cool stuff"
@@ -55,7 +100,7 @@ just execute `cargo build`
 
 
 ## Supported Platforms
-I develop and test this under Lunix/X11. I do not test on other platforms.
+I develop and test this under Linux/X11. I do not test on other platforms.
 
 The only platform dependent crate this project depends on is [rdev](https://github.com/Narsil/rdev).
 
@@ -67,8 +112,9 @@ In theory, rdev supports:
 Unfortunately listening on mouse/keyboard events is not supported for linux/Wayland.
 
 ## State of development
-The tool is usable. Main functionality is implemented.
+The tool is usable. Core functionality is implemented. "It works for me", but far from a clean stable and widely usable product.
 
 Notable missing functions are:
 - Lock file to prevent multiple running instances to write to same data file
 - User interface for adding comments to worktime entries
+- Better Frontend
