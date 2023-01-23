@@ -39,7 +39,7 @@ The configuration file is placed in your operating system's default path. Unter 
 
 The following options can be configured:
 
-- `timeout_minues`: number in minutes of allowed absence. After this time, the absence is counted as a break and a worktime entry (start/end times) is closed. After mouse/keyboard activity is registered again, a new worktime entry is automatically started.
+- `timeout_minutes`: number in minutes of allowed absence. After this time, the absence is counted as a break and a worktime entry (start/end times) is closed. After mouse/keyboard activity is registered again, a new worktime entry is automatically started.
 - `data_file`: path to a `.csv` file which is used as storage of worktime entries.
 - `auto_save_interval_seconds`: time period in which worktime entries are automatically stored to the data file. Note on `Ctrl`+`C` all entries are also stored.
 
