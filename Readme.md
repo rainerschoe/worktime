@@ -4,7 +4,7 @@ A simple worktime tracker.
 
 It automatically  records your work time based on mouse/keyboard activity.
 
-Example output:
+Example user output:
 ```
  Start: 2023-01-23 08:39:43 End: 10:52:18 (2h12m35s) "Meetings, Some coding"
   Pause: 0h20m2s
@@ -12,6 +12,13 @@ Example output:
   Pause: 0h36m27s
  Start: 2023-01-23 12:54:08 End: 13:06:24 (0h12m15s) ""
 Current: Day: 3h30m10s, Week: 3h30m10s, Month: 3h30m1
+```
+
+The data is stored in a csv-based database:
+```
+2023-01-23T08:39:43.411602735+01:00,2023-01-23T10:52:18.508372583+01:00,"Meetings, Some coding"
+2023-01-23T11:12:21.348136902+01:00,2023-01-23T12:17:40.865009498+01:00,"Read about cool stuff"
+2023-01-23T12:54:08.544242070+01:00,2023-01-23T13:06:24.430300568+01:00,
 ```
 
 ## Scope
