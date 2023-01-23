@@ -20,12 +20,9 @@ A work pause is detected as follows:
 Times when keyboard/mouse activity was recognized:
 ```
 10:00:00
-10:00:01
 10:00:02
 10:05:00
 10:15:01
-10:15:02
-10:15:03
 10:18:01
 ```
 Will lead to the following classification (timeout_minutes=10):
