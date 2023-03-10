@@ -1,3 +1,4 @@
+use std::collections::btree_map::Iter;
 use std::error::Error;
 
 use chrono::Datelike;
@@ -9,6 +10,8 @@ use std::thread;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
 use serde::{Deserialize, Serialize};
+use chrono::{offset::TimeZone, Local};
+
 
 // TODO: file lock: prevent multiple workday instances running on same data store file
 
@@ -37,12 +40,20 @@ fn format_chrono_duration(duration: &chrono::Duration) -> String {
     format!("{}h{}m{}s", hours, mins, secs)
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, PartialOrd, Eq, Ord, Clone)]
 struct WorktimeEntry {
     start: chrono::DateTime<chrono::offset::Local>,
     end: chrono::DateTime<chrono::offset::Local>,
     //comments: Vec<String>,
     comments: String,
+}
+
+impl WorktimeEntry
+{
+    fn duration(self: &Self) -> chrono::Duration
+    {
+        return self.end-self.start;
+    }
 }
 
 #[derive(Default)]
@@ -83,6 +94,135 @@ impl Database {
         Ok(())
     }
 
+    fn is_in_range<T : core::cmp::PartialOrd>(element: &T, start: &T, end: &T) -> bool
+    {
+        element >= start && element <= end
+    }
+
+    fn query<'a>(
+        self: &'a Self,
+        range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
+    ) -> impl Iterator<Item = WorktimeEntry> + '_
+    {
+        let first = range.0.clone();
+        let second = range.1.clone();
+        let it = self.rows.iter()
+            .filter(move |x|
+                {
+                    let result = Self::is_in_range(&x.start, &first, &second)
+                    ||
+                    Self::is_in_range(&x.end, &first, &second);
+                    result
+                }
+            )
+            .map::<WorktimeEntry, _>(move |x|
+            {
+                if x.start >= first && x.end <= second
+                {
+                    // trivial case: entry is completely inside the searched range. Return it:
+                    return x.clone();
+                }
+
+                let cut_start = if x.start <= first
+                    {
+                        first
+                    }
+                    else 
+                    {
+                        x.start
+                    };
+
+                let cut_end = if second <= x.end
+                    {
+                        second
+                    }
+                    else 
+                    {
+                        x.end
+                    };
+                WorktimeEntry { start: cut_start, end: cut_end, comments: x.comments.clone() }
+            });
+        it
+    }
+
+
+    fn get_day_bounds(time: chrono::DateTime<chrono::offset::Local>) -> (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
+    {
+        let date = chrono::NaiveDate::from_ymd_opt(time.year(), time.month(), time.day()).unwrap();
+
+        let time_start = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
+        let time_end = chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
+
+        let day_start = chrono::NaiveDateTime::new(date,time_start);
+        let day_end = chrono::NaiveDateTime::new(date,time_end);
+
+        let local_day_start = Local.from_local_datetime(&day_start).unwrap();
+        let local_day_end = Local.from_local_datetime(&day_end).unwrap();
+        (local_day_start, local_day_end)
+    }
+
+    fn get_week_bounds(time: chrono::DateTime<chrono::offset::Local>) -> (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
+    {
+        let week = time.iso_week();
+
+        let date_start = chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Mon).unwrap();
+        let date_end = chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Sun).unwrap();
+
+        let time_start = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
+        let time_end = chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
+
+        let start = chrono::NaiveDateTime::new(date_start,time_start);
+        let end = chrono::NaiveDateTime::new(date_end,time_end);
+        let local_start = Local.from_local_datetime(&start).unwrap();
+        let local_end = Local.from_local_datetime(&end).unwrap();
+        (local_start, local_end)
+    }
+
+    fn print_simple_summary(self: &Self)
+    {
+        let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+
+        let mut previous_entry: Option<WorktimeEntry> = None;
+        let mut day_sum = chrono::Duration::seconds(0);
+        for entry in 
+            self.query(Self::get_day_bounds(now))
+        {
+            if let Some(previous_entry) = previous_entry {
+                println!(
+                    "  Pause: {}",
+                    format_chrono_duration(&(entry.start - previous_entry.end))
+                );
+            }
+            println!(
+                " Start: {} End: {} ({}) {:#?}",
+                entry.start.format("%Y-%m-%d %T"),
+                entry.end.format("%T"),
+                format_chrono_duration(&entry.duration()),
+                entry.comments
+            );
+            day_sum = day_sum + entry.duration();
+            previous_entry = Some(entry);
+        }
+
+        let mut week_sum = chrono::Duration::seconds(0);
+        for i in 
+            self.query(Self::get_week_bounds(now))
+        {
+            week_sum = week_sum + i.duration();
+        }
+
+        println!(
+            "Current: Day: {}, Week: {}",
+            format_chrono_duration(&day_sum),
+            format_chrono_duration(&week_sum),
+        );
+    }
+
+    // idea:
+    // query(start time, end time) -> iter/List of worktime entries
+    // split(time, WorktimeEntry) -> (before_time=Option<WorktimeEntry>, after_time=Option<WorktimeEntry>)
+    // sum(iter/List of worktime Entries) -> (List(dailySum(Day, sum_hours)), List(weekly_sum(Day,hours)), ..., TotalSumHours)
+    // split needed in query (to cut start and end entries) and also in sum, to cut day start/end entries
     fn print_summary(
         self: &Self,
         first: chrono::DateTime<chrono::offset::Local>,
@@ -264,7 +404,7 @@ fn main() {
                 .store_file(data_path_signals.into())
                 .unwrap();
             // lock mutex here, which prevents any auto-save to try saving while we exit
-            let lock = file_mutex_signal.lock();
+            let _lock = file_mutex_signal.lock();
             std::process::exit(0);
         }
     });
@@ -289,7 +429,7 @@ fn main() {
             cfg.auto_save_interval_seconds,
         ));
         println!("Auto-Save");
-        let lock = file_mutex_auto_save.lock();
+        let _lock = file_mutex_auto_save.lock();
         database_autosave
             .lock()
             .unwrap()
@@ -312,6 +452,7 @@ fn main() {
             .unwrap()
             .handle_event(EventType::Commit);
         println!("---");
-        database.lock().unwrap().print_summary(day_start, day_end);
+        //database.lock().unwrap().print_summary(day_start, day_end);
+        database.lock().unwrap().print_simple_summary();
     }
 }
