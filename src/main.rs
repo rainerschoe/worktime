@@ -20,6 +20,9 @@ struct Config {
     timeout_minutes: u64,
     data_file: String,
     auto_save_interval_seconds: u64,
+    weekly_hours: f64,
+    cutoff_day_overtime_hours: f64,
+    cutoff_datetime: chrono::DateTime<chrono::offset::Local>
 }
 
 impl ::std::default::Default for Config {
@@ -27,7 +30,11 @@ impl ::std::default::Default for Config {
         Self {
             timeout_minutes: 10,
             data_file: "~/.worktime.csv".into(),
+            special_day_file: "~/.special_days.csv".into(),
             auto_save_interval_seconds: 30,
+            weekly_hours: 40,
+            cutoff_day_overtime_hours: 0,
+            cutoff_datetime: "2023-05-01T00:00:00.00+02:00".parse().unwrap()
         }
     }
 }
@@ -48,6 +55,18 @@ struct WorktimeEntry {
     comments: String,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, PartialOrd, Eq, Ord, Clone)]
+enum SpecialDayType {
+    Vacation,
+    Sick,
+    Leave
+}
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, PartialOrd, Eq, Ord, Clone)]
+struct SpecialDayEntry {
+    day: chrono::naive::NaiveDate,
+    day_type: SpecialDayType
+}
+
 impl WorktimeEntry
 {
     fn duration(self: &Self) -> chrono::Duration
@@ -59,10 +78,11 @@ impl WorktimeEntry
 #[derive(Default)]
 struct Database {
     rows: Vec<WorktimeEntry>,
+    special_days: Vec<SpecialDayEntry>
 }
 
 impl Database {
-    /// if last element in database hase same start time it is overwritten. otherwise new element is pushed
+    /// if last element in database has same start time it is overwritten. otherwise new element is pushed
     fn commit_worktime(self: &mut Self, entry: WorktimeEntry) {
         if self.rows.len() > 0 && self.rows[self.rows.len() - 1].start == entry.start {
             self.rows.pop();
@@ -73,7 +93,9 @@ impl Database {
     fn load_file_and_append(
         self: &mut Self,
         path: std::path::PathBuf,
+        path_special_days: std::path::PathBuf,
     ) -> Result<(), Box<dyn Error>> {
+        // load worktime:
         let mut rdr = csv::Reader::from_path(path)?;
         for result in rdr.deserialize() {
             // Notice that we need to provide a type hint for automatic
@@ -82,6 +104,18 @@ impl Database {
             self.rows.push(record);
         }
         self.rows.sort();
+
+        // load special days:
+        let mut rdr = csv::Reader::from_path(path_special_days)?;
+        for result in rdr.deserialize() {
+            // Notice that we need to provide a type hint for automatic
+            // deserialization.
+            let record: SpecialDayEntry = result?;
+            self.special_days.push(record);
+        }
+        self.special_days.sort();
+
+
         Ok(())
     }
 
@@ -216,6 +250,51 @@ impl Database {
             format_chrono_duration(&day_sum),
             format_chrono_duration(&week_sum),
         );
+    }
+
+    // TODO: this really requires unittesting...
+    fn calculate_overtime(
+        self: &Self
+        weekly_worktime: chrono::Duration,
+        start_datetime: chrono::DateTime<chrono::offset::Local>
+        ) -> chrono::Duration
+    {
+        let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+        let (start_of_today, _) = Self::get_day_bounds(now);
+        let (start_of_calculation, _) = Self::get_day_bounds(start_datetime);
+
+        // calculating per day overtime and assuming mostly work only during the week.
+        // (Will still calculate weekends correctly, though setting the expectation to work mo-fr)
+        // i.e. expect each day mo-f: weekly_hours/5 h of work and expect sa-so 0h of work
+        let mut total_hours = chrono::Duration::seconds(0);
+        for i in 
+            self.query( (start_of_calculation, start_of_today) )
+        {
+            total_hours = total_hours + i.duration();
+        }
+
+        let range = (start_of_today - start_of_calculation).num_days;
+        let weeks = range/7;
+        let days = range-weeks*7;
+        let expected_from_whole_weeks = weeks * weekly_worktime;
+
+        // now simulate partial week. We need to do this, as sat and sun do not count and we are
+        // not aligned with weeks:
+        let mut expected_from_partial_weeks = chrono::Duration::seconds(0);
+        let mut day_of_partial_week = (start_of_calculation + chrono::Duration::days(1) * 7 * weeks).weekday();
+        for i in 0..days
+        {
+            if 
+                (day_of_partial_week != chrono::Weekday::Sat) &&
+                (day_of_partial_week != chrono::Weekday::Sun)
+            {
+
+                expected_from_partial_weeks = expected_from_partial_weeks + weekly_worktime / 5;
+            }
+            day_of_partial_week = day_of_partial_week.succ();
+        }
+
+        return total_hours - expected_from_whole_weeks - expected_from_partial_weeks;
     }
 
     // idea:
