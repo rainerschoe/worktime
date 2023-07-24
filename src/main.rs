@@ -133,6 +133,23 @@ impl Database {
         element >= start && element <= end
     }
 
+    fn query_special_days<'a>(
+        self: &'a Self,
+        range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
+    ) -> impl Iterator<Item = SpecialDayEntry> + '_
+    {
+        let first = range.0.clone();
+        let second = range.1.clone();
+        let it = self.specual_days.iter()
+            .filter(move |x|
+                {
+                    let day = chrono::DateTime<chrono::offset::Local>::from_local(x.day);
+                    Self::is_in_range(&day, &first, &second)
+                }
+            );
+        it
+    }
+
     fn query<'a>(
         self: &'a Self,
         range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
@@ -278,13 +295,13 @@ impl Database {
         let days = range-weeks*7;
         let expected_from_whole_weeks = weeks * weekly_worktime;
 
-        // now simulate partial week. We need to do this, as sat and sun do not count and we are
-        // not aligned with weeks:
+        // now simulate partial week. We need to do this, as sat and sun do not count as expected
+        // work days and we are not aligned with weeks:
         let mut expected_from_partial_weeks = chrono::Duration::seconds(0);
         let mut day_of_partial_week = (start_of_calculation + chrono::Duration::days(1) * 7 * weeks).weekday();
         for i in 0..days
         {
-            if 
+            if
                 (day_of_partial_week != chrono::Weekday::Sat) &&
                 (day_of_partial_week != chrono::Weekday::Sun)
             {
@@ -294,7 +311,22 @@ impl Database {
             day_of_partial_week = day_of_partial_week.succ();
         }
 
-        return total_hours - expected_from_whole_weeks - expected_from_partial_weeks;
+        // now calculate bonus hours received from special days:
+        let mut special_days_bonus_time = chrono::Duration::seconds(0);
+        for i in 
+            self.query_special_days( (start_of_calculation, start_of_today) )
+        {
+            // weekends cannot have special days:
+            match i.day.weekday()
+            {
+                chrono::Weekday::Sat => (),
+                chrono::Weekday::Sun => (),
+                _ => { special_days_bonus_time = special_days_bonus_time + weekly_worktime / 5; }
+            }
+        }
+
+
+        return total_hours - expected_from_whole_weeks - expected_from_partial_weeks + special_days_bonus_time;
     }
 
     // idea:
