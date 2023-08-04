@@ -10,13 +10,6 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 use serde::{Deserialize, Serialize};
 use chrono::{offset::TimeZone, Local};
 
-// TODO: file lock: prevent multiple workday instances running on same data store file
-// https://docs.rs/proc-lock/latest/proc_lock/ << this could be useful
-// Need to think about two things:
-// - how to prevent data races on write level?
-// - how to prevent two worktime tracking instqances from running together creatng suplicate
-// entries while still allowing CLI queries
-
 #[derive(Serialize, Deserialize)]
 struct Config {
     timeout_minutes: u64,
