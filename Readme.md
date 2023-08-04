@@ -3,6 +3,7 @@
 A simple worktime tracker.
 
 It automatically records your work time based on mouse/keyboard activity.
+It also allows you to track over-time.
 
 ## Concept
 
@@ -52,6 +53,38 @@ Current: Day: 3h30m10s, Week: 3h30m10s, Month: 3h30m1
 This is periodically printed to stdout when the tool is running.
 
 I plan to implement a better frontend as soon as I have some more time... I am also happy to accept PRs ;)
+
+#### Overtime:
+Current accumulated overtime can be printed:
+```
+> worktime --overtime
+overtime: 6h40m12s
+```
+
+For accurate overtime calculations, be sure to adjust
+
+- weekly\_hours
+- cutoff\_day\_overtime\_hours
+- cutoff\_datetime
+
+in the config file.
+
+Overtime calculation considers special days (public holidays, sick days, vacation). However all those days need to be entered into a special manually edited csv file. The path is specified in the config file under `special_day_file`. 
+File format is like this:
+```
+day,day_type
+2023-05-29,Holiday
+2023-06-08,Holiday
+```
+Valid `day_type` values are `Vacation`, `Sick`, `Leave` and `Holiday`. 
+For each special day, a bonus of `weekly_hours/5` is added.
+
+Overtime calculation roughly works like this:
+- For each day an expected work-time is assumed to be
+    - Special Day: 0
+    - Saturday+Sunday: 0
+    - Monday-Friday: `weekly_hours/5`.
+- Overtime is calculated to be the sum of worked time minus expected time in a given range.
 
 #### Editing worktime:
 The tool mostly manages data capture automatically. The idea is to avoid heavy manual editing of worktime. If you want to do this, this tool might not be what you are looking for.
