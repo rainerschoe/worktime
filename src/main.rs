@@ -26,8 +26,6 @@ struct Config {
     weekly_hours: i64,
     cutoff_day_overtime_hours: f64,
     cutoff_datetime: chrono::DateTime<chrono::offset::Local>,
-    use_overtime_end: bool,
-    overtime_end: chrono::DateTime<chrono::offset::Local>
 }
 
 impl ::std::default::Default for Config {
@@ -40,8 +38,6 @@ impl ::std::default::Default for Config {
             weekly_hours: 30,
             cutoff_day_overtime_hours: 0.0,
             cutoff_datetime: "2023-05-01T00:00:00.00+02:00".parse().unwrap(),
-            use_overtime_end: false,
-            overtime_end: "2023-05-01T00:00:00.00+02:00".parse().unwrap()
         }
     }
 }
@@ -505,11 +501,7 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
 
     // monitor terminal input:
     // TODO
-    let overtime_end : chrono::DateTime<chrono::offset::Local> = match cfg.use_overtime_end
-    {
-        true => cfg.overtime_end,
-        false => std::time::SystemTime::now().into()
-    };
+    let overtime_end : chrono::DateTime<chrono::offset::Local> =  std::time::SystemTime::now().into();
     let overtime = database.lock().unwrap().calculate_overtime(
         chrono::Duration::hours(cfg.weekly_hours),
         (cfg.cutoff_datetime, overtime_end)
@@ -552,16 +544,10 @@ fn main() {
     let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
     println!("Using special_day file {}", special_day_path.display());
 
-    let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
-
     let database = Arc::new(Mutex::new(Database::init(data_path, special_day_path).unwrap()));
     if args.overtime
     {
-        let overtime_end : chrono::DateTime<chrono::offset::Local> = match cfg.use_overtime_end
-        {
-            true => cfg.overtime_end,
-            false => std::time::SystemTime::now().into()
-        };
+        let overtime_end : chrono::DateTime<chrono::offset::Local> =  std::time::SystemTime::now().into();
         let overtime = database.lock().unwrap().calculate_overtime(
             chrono::Duration::hours(cfg.weekly_hours),
             (cfg.cutoff_datetime, overtime_end)
@@ -569,6 +555,10 @@ fn main() {
         println!("overtime: {}", format_chrono_duration(&overtime));
     }
     else {
+        // No two processes are allowed to monitor worktime at the same time.
+        // It would lead to races in writing database file.
+        let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
+        {
         if let Ok(_guard) = monitoring_lock.try_lock()
         {
             run_interactive_monitoring(database, &cfg);
@@ -576,6 +566,7 @@ fn main() {
         else {
             println!("Another process is already monitoring worktime. exiting...")
         }
+        };
     }
 }
 
