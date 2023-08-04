@@ -76,8 +76,7 @@ day,day_type
 2023-05-29,Holiday
 2023-06-08,Holiday
 ```
-Valid `day_type` values are `Vacation`, `Sick`, `Leave` and `Holiday`. 
-For each special day, a bonus of `weekly_hours/5` is added.
+Valid `day_type` values are `Vacation`, `Sick`, `Leave` and `Holiday`. The `day_type` does not have any functional implications yet.
 
 Overtime calculation roughly works like this:
 - For each day an expected work-time is assumed to be
