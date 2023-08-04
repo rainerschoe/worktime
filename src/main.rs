@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use chrono::{offset::TimeZone, Local};
 
 // TODO: file lock: prevent multiple workday instances running on same data store file
+// https://docs.rs/proc-lock/latest/proc_lock/ << this could be useful
+// Need to think about two things:
+// - how to prevent data races on write level?
+// - how to prevent two worktime tracking instqances from running together creatng suplicate
+// entries while still allowing CLI queries
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -80,6 +85,7 @@ impl WorktimeEntry
 
 #[derive(Default)]
 struct Database {
+    path: std::path::PathBuf,
     rows: Vec<WorktimeEntry>,
     special_days: Vec<SpecialDayEntry>
 }
@@ -93,16 +99,18 @@ impl Database {
         self.rows.push(entry);
     }
 
-    fn load_file_and_append(
-        self: &mut Self,
+    fn init(
         path: std::path::PathBuf,
         path_special_days: std::path::PathBuf,
-    ) -> Result<(), String> {
+    ) -> Result<Self, String> {
+
+        let mut db = Database{path: path.clone(), rows: Vec::new(), special_days: Vec::new()};
         // load worktime:
         let rdr = csv::Reader::from_path(path.clone());
         if let Err(err) = rdr
         {
-            return Err(format!("Could not read {}: {}", path.display(), err));
+            println!("Note: Database could not be fully initialized. Continuing with partially initialized database. Could not read {}: {}", path.display(), err);
+            return Ok(db);
         }
         let mut rdr = rdr.unwrap();
         for result in rdr.deserialize() {
@@ -113,15 +121,15 @@ impl Database {
                 return Err(format!("deserialize {}: {}", path.display(), err));
             }
             let record: WorktimeEntry = result.unwrap();
-            self.rows.push(record);
+            db.rows.push(record);
         }
-        self.rows.sort();
+        db.rows.sort();
 
         // load special days:
         let rdr = csv::Reader::from_path(path_special_days.clone());
-        if let Err(err) = rdr
+        if let Err(ref err) = rdr
         {
-            return Err(format!("Could not read {}: {}", path_special_days.display(), err));
+            println!("Note: Database could not be fully initialized. Continuing with partially initialized database. Could not read {}: {}", path_special_days.display(), err);
         }
         let mut rdr = rdr.unwrap();
         for result in rdr.deserialize() {
@@ -132,16 +140,16 @@ impl Database {
                 return Err(format!("deserialize {}: {}", path_special_days.display(), err));
             }
             let record: SpecialDayEntry = result.unwrap();
-            self.special_days.push(record);
+            db.special_days.push(record);
         }
-        self.special_days.sort();
+        db.special_days.sort();
 
 
-        Ok(())
+        Ok(db)
     }
 
-    fn store_file(self: &Self, path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
-        let mut wtr = csv::Writer::from_path(path)?;
+    fn store_file(self: &Self) -> Result<(), Box<dyn Error>> {
+        let mut wtr = csv::Writer::from_path(self.path.clone())?;
         for row in self.rows.iter() {
             wtr.serialize(row)?;
         }
@@ -419,28 +427,8 @@ impl ActivityRecorder {
     }
 }
 
-fn main() {
-    let cfg: Config = confy::load("worktime", None).unwrap();
-
-    let database = Arc::new(Mutex::new(Database::default()));
-
-    let data_path = expanduser::expanduser(cfg.data_file.as_str()).unwrap();
-    println!("Using data file {}", data_path.display());
-
-    let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
-    println!("Using special_day file {}", special_day_path.display());
-
-    if let Err(err) = database
-        .lock()
-        .unwrap()
-        .load_file_and_append(data_path.clone().into(), special_day_path.clone().into())
-    {
-        println!(
-            "Note: Database could not be fully initialized. Continuing with partially initialized database. {}",
-            err
-        );
-    }
-
+fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
+{
     let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(
         database.clone(),
         cfg.timeout_minutes,
@@ -454,7 +442,6 @@ fn main() {
     // monitor signals:
     let activity_recorder_signals = activity_recorder.clone();
     let database_signals = database.clone();
-    let data_path_signals = data_path.clone();
     thread::spawn(move || {
         let mut signals = Signals::new(&[SIGINT]).unwrap();
         for sig in signals.forever() {
@@ -467,7 +454,7 @@ fn main() {
             database_signals
                 .lock()
                 .unwrap()
-                .store_file(data_path_signals.into())
+                .store_file()
                 .unwrap();
             // lock mutex here, which prevents any auto-save to try saving while we exit
             let _lock = file_mutex_signal.lock();
@@ -490,16 +477,17 @@ fn main() {
 
     // auto-save:
     let database_autosave = database.clone();
+    let auto_save_interval_seconds = cfg.auto_save_interval_seconds.clone();
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(
-            cfg.auto_save_interval_seconds,
+            auto_save_interval_seconds,
         ));
         println!("Auto-Save");
         let _lock = file_mutex_auto_save.lock();
         database_autosave
             .lock()
             .unwrap()
-            .store_file(data_path.clone().into())
+            .store_file()
             .unwrap();
     });
 
@@ -531,6 +519,21 @@ fn main() {
         //database.lock().unwrap().print_summary(day_start, day_end);
         database.lock().unwrap().print_simple_summary();
     }
+
+}
+
+fn main() {
+    let cfg: Config = confy::load("worktime", None).unwrap();
+
+    let data_path = expanduser::expanduser(cfg.data_file.as_str()).unwrap();
+    println!("Using data file {}", data_path.display());
+
+    let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
+    println!("Using special_day file {}", special_day_path.display());
+
+    let database = Arc::new(Mutex::new(Database::init(data_path, special_day_path).unwrap()));
+
+    run_interactive_monitoring(database, &cfg);
 }
 
 #[test]
