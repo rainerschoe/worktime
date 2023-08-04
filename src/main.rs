@@ -83,11 +83,11 @@ impl WorktimeEntry
     }
 }
 
-#[derive(Default)]
 struct Database {
     path: std::path::PathBuf,
     rows: Vec<WorktimeEntry>,
-    special_days: Vec<SpecialDayEntry>
+    special_days: Vec<SpecialDayEntry>,
+    file_access_lock: named_lock::NamedLock
 }
 
 impl Database {
@@ -104,24 +104,35 @@ impl Database {
         path_special_days: std::path::PathBuf,
     ) -> Result<Self, String> {
 
-        let mut db = Database{path: path.clone(), rows: Vec::new(), special_days: Vec::new()};
+        let file_access_lock = named_lock::NamedLock::create("worktime_file_access").unwrap();
+        let mut db = Database{path: path.clone(), rows: Vec::new(), special_days: Vec::new(), file_access_lock: file_access_lock};
         // load worktime:
+        let mut read_error :Option<csv::Error> = None;
+        {
+        let _guard = db.file_access_lock.lock();
         let rdr = csv::Reader::from_path(path.clone());
         if let Err(err) = rdr
         {
+            read_error = Some(err);
+        }
+        else {
+            let mut rdr = rdr.unwrap();
+            for result in rdr.deserialize() {
+                // Notice that we need to provide a type hint for automatic
+                // deserialization.
+                if let Err(err) = result
+                {
+                    return Err(format!("deserialize {}: {}", path.display(), err));
+                }
+                let record: WorktimeEntry = result.unwrap();
+                db.rows.push(record);
+            }
+        }
+        }
+        if let Some(err) = read_error
+        {
             println!("Note: Database could not be fully initialized. Continuing with partially initialized database. Could not read {}: {}", path.display(), err);
             return Ok(db);
-        }
-        let mut rdr = rdr.unwrap();
-        for result in rdr.deserialize() {
-            // Notice that we need to provide a type hint for automatic
-            // deserialization.
-            if let Err(err) = result
-            {
-                return Err(format!("deserialize {}: {}", path.display(), err));
-            }
-            let record: WorktimeEntry = result.unwrap();
-            db.rows.push(record);
         }
         db.rows.sort();
 
@@ -149,6 +160,7 @@ impl Database {
     }
 
     fn store_file(self: &Self) -> Result<(), Box<dyn Error>> {
+        let _guard = self.file_access_lock.lock();
         let mut wtr = csv::Writer::from_path(self.path.clone())?;
         for row in self.rows.iter() {
             wtr.serialize(row)?;
@@ -521,8 +533,17 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
     }
 
 }
+use clap::Parser;
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Name of the person to greet
+    #[clap(long, short, action)]
+    overtime: bool
+}
 
 fn main() {
+    let args = Args::parse();
     let cfg: Config = confy::load("worktime", None).unwrap();
 
     let data_path = expanduser::expanduser(cfg.data_file.as_str()).unwrap();
@@ -531,9 +552,31 @@ fn main() {
     let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
     println!("Using special_day file {}", special_day_path.display());
 
-    let database = Arc::new(Mutex::new(Database::init(data_path, special_day_path).unwrap()));
+    let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
 
-    run_interactive_monitoring(database, &cfg);
+    let database = Arc::new(Mutex::new(Database::init(data_path, special_day_path).unwrap()));
+    if args.overtime
+    {
+        let overtime_end : chrono::DateTime<chrono::offset::Local> = match cfg.use_overtime_end
+        {
+            true => cfg.overtime_end,
+            false => std::time::SystemTime::now().into()
+        };
+        let overtime = database.lock().unwrap().calculate_overtime(
+            chrono::Duration::hours(cfg.weekly_hours),
+            (cfg.cutoff_datetime, overtime_end)
+            );
+        println!("overtime: {}", format_chrono_duration(&overtime));
+    }
+    else {
+        if let Ok(_guard) = monitoring_lock.try_lock()
+        {
+            run_interactive_monitoring(database, &cfg);
+        }
+        else {
+            println!("Another process is already monitoring worktime. exiting...")
+        }
+    }
 }
 
 #[test]
