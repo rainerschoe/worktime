@@ -377,7 +377,7 @@ impl Database {
 
 enum EventType {
     Activity(Event),
-    Comment(String), // TODO: implement comment user interface
+    _Comment(String), // TODO: implement comment user interface
     Commit,
 }
 
@@ -422,7 +422,7 @@ impl ActivityRecorder {
                 }
                 self.last_event_time = event_time;
             }
-            EventType::Comment(comment) => {
+            EventType::_Comment(comment) => {
                 self.comments.push_str(&comment);
             }
             EventType::Commit => {
@@ -537,7 +537,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Name of the person to greet
+    /// Show accumulated overtime
     #[clap(long, short, action)]
     overtime: bool
 }
