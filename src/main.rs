@@ -301,6 +301,33 @@ impl Database {
         );
     }
 
+
+    fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration
+    {
+        let mut day_sum = chrono::Duration::seconds(0);
+        for entry in 
+            self.query(Self::get_day_bounds(day))
+        {
+            day_sum = day_sum + entry.duration();
+        }
+        day_sum
+    }
+
+    fn get_day_sums(self: &Self, num_days: u64) -> Vec::<(chrono::DateTime<chrono::offset::Local>, chrono::Duration)>
+    {
+        let mut time: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+
+        let mut result = Vec::new();
+        for _ in 0..num_days
+        {
+            let bounds = Self::get_day_bounds(time);
+            result.push((bounds.1, self.get_day_sum(time)));
+            time -= chrono::Duration::hours(24);
+        }
+
+        result
+    }
+
     // TODO: this really requires unittesting...
     fn calculate_overtime(
         self: &Self,
@@ -524,7 +551,9 @@ use clap::Parser;
 struct Args {
     /// Show accumulated overtime
     #[clap(long, short, action)]
-    overtime: bool
+    overtime: bool,
+    #[clap(long, short, action)]
+    daysums: Option<u64>
 }
 
 fn main() {
@@ -546,6 +575,14 @@ fn main() {
             (cfg.cutoff_datetime, overtime_end)
             );
         println!("overtime: {}", format_chrono_duration(&overtime));
+    }
+    else if let Some(days) = args.daysums
+    {
+        let daysums = database.lock().unwrap().get_day_sums(days);
+        for (time, sum) in daysums
+        {
+            println!("{}: {}", time.format("%a %Y-%m-%d") , format_chrono_duration(&sum));
+        }
     }
     else {
         // No two processes are allowed to monitor worktime at the same time.
