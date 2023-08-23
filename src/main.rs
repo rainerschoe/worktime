@@ -7,8 +7,8 @@ use std::thread;
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
-use serde::{Deserialize, Serialize};
 use chrono::{offset::TimeZone, Local};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -56,19 +56,17 @@ enum SpecialDayType {
     Vacation,
     Sick,
     Leave,
-    Holiday
+    Holiday,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, PartialOrd, Eq, Ord, Clone)]
 struct SpecialDayEntry {
     day: chrono::naive::NaiveDate,
-    day_type: SpecialDayType
+    day_type: SpecialDayType,
 }
 
-impl WorktimeEntry
-{
-    fn duration(self: &Self) -> chrono::Duration
-    {
-        return self.end-self.start;
+impl WorktimeEntry {
+    fn duration(self: &Self) -> chrono::Duration {
+        return self.end - self.start;
     }
 }
 
@@ -76,7 +74,7 @@ struct Database {
     path: std::path::PathBuf,
     rows: Vec<WorktimeEntry>,
     special_days: Vec<SpecialDayEntry>,
-    file_access_lock: named_lock::NamedLock
+    file_access_lock: named_lock::NamedLock,
 }
 
 impl Database {
@@ -92,34 +90,34 @@ impl Database {
         path: std::path::PathBuf,
         path_special_days: std::path::PathBuf,
     ) -> Result<Self, String> {
-
         let file_access_lock = named_lock::NamedLock::create("worktime_file_access").unwrap();
-        let mut db = Database{path: path.clone(), rows: Vec::new(), special_days: Vec::new(), file_access_lock: file_access_lock};
+        let mut db = Database {
+            path: path.clone(),
+            rows: Vec::new(),
+            special_days: Vec::new(),
+            file_access_lock: file_access_lock,
+        };
         // load worktime:
-        let mut read_error :Option<csv::Error> = None;
+        let mut read_error: Option<csv::Error> = None;
         {
-        let _guard = db.file_access_lock.lock();
-        let rdr = csv::Reader::from_path(path.clone());
-        if let Err(err) = rdr
-        {
-            read_error = Some(err);
-        }
-        else {
-            let mut rdr = rdr.unwrap();
-            for result in rdr.deserialize() {
-                // Notice that we need to provide a type hint for automatic
-                // deserialization.
-                if let Err(err) = result
-                {
-                    return Err(format!("deserialize {}: {}", path.display(), err));
+            let _guard = db.file_access_lock.lock();
+            let rdr = csv::Reader::from_path(path.clone());
+            if let Err(err) = rdr {
+                read_error = Some(err);
+            } else {
+                let mut rdr = rdr.unwrap();
+                for result in rdr.deserialize() {
+                    // Notice that we need to provide a type hint for automatic
+                    // deserialization.
+                    if let Err(err) = result {
+                        return Err(format!("deserialize {}: {}", path.display(), err));
+                    }
+                    let record: WorktimeEntry = result.unwrap();
+                    db.rows.push(record);
                 }
-                let record: WorktimeEntry = result.unwrap();
-                db.rows.push(record);
             }
         }
-        }
-        if let Some(err) = read_error
-        {
+        if let Some(err) = read_error {
             println!("Note: Database could not be fully initialized. Continuing with partially initialized database. Could not read {}: {}", path.display(), err);
             return Ok(db);
         }
@@ -127,23 +125,24 @@ impl Database {
 
         // load special days:
         let rdr = csv::Reader::from_path(path_special_days.clone());
-        if let Err(ref err) = rdr
-        {
+        if let Err(ref err) = rdr {
             println!("Note: Database could not be fully initialized. Continuing with partially initialized database. Could not read {}: {}", path_special_days.display(), err);
         }
         let mut rdr = rdr.unwrap();
         for result in rdr.deserialize() {
             // Notice that we need to provide a type hint for automatic
             // deserialization.
-            if let Err(err) = result
-            {
-                return Err(format!("deserialize {}: {}", path_special_days.display(), err));
+            if let Err(err) = result {
+                return Err(format!(
+                    "deserialize {}: {}",
+                    path_special_days.display(),
+                    err
+                ));
             }
             let record: SpecialDayEntry = result.unwrap();
             db.special_days.push(record);
         }
         db.special_days.sort();
-
 
         Ok(db)
     }
@@ -158,117 +157,114 @@ impl Database {
         Ok(())
     }
 
-    fn is_in_range<T : core::cmp::PartialOrd>(element: &T, start: &T, end: &T) -> bool
-    {
+    fn is_in_range<T: core::cmp::PartialOrd>(element: &T, start: &T, end: &T) -> bool {
         element >= start && element < end
     }
 
     fn query_special_days<'a>(
         self: &'a Self,
-        range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
-    ) -> impl Iterator<Item = &SpecialDayEntry> + '_
-    {
+        range: (
+            chrono::DateTime<chrono::offset::Local>,
+            chrono::DateTime<chrono::offset::Local>,
+        ),
+    ) -> impl Iterator<Item = &SpecialDayEntry> + '_ {
         let first = range.0.clone();
         let second = range.1.clone();
-        let it = self.special_days.iter()
-            .filter(move |x|
-                {
-                    let naive_day = x.day.and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-                    let day = chrono::Local.from_local_datetime(&naive_day).unwrap();
-                    Self::is_in_range(&day, &first, &second)
-                }
-            );
+        let it = self.special_days.iter().filter(move |x| {
+            let naive_day = x
+                .day
+                .and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+            let day = chrono::Local.from_local_datetime(&naive_day).unwrap();
+            Self::is_in_range(&day, &first, &second)
+        });
         it
     }
 
     fn query<'a>(
         self: &'a Self,
-        range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
-    ) -> impl Iterator<Item = WorktimeEntry> + '_
-    {
+        range: (
+            chrono::DateTime<chrono::offset::Local>,
+            chrono::DateTime<chrono::offset::Local>,
+        ),
+    ) -> impl Iterator<Item = WorktimeEntry> + '_ {
         let first = range.0.clone();
         let second = range.1.clone();
-        let it = self.rows.iter()
-            .filter(move |x|
-                {
-                    let result = Self::is_in_range(&x.start, &first, &second)
-                    ||
-                    Self::is_in_range(&x.end, &first, &second);
-                    result
-                }
-            )
-            .map::<WorktimeEntry, _>(move |x|
-            {
-                if x.start >= first && x.end <= second
-                {
+        let it = self
+            .rows
+            .iter()
+            .filter(move |x| {
+                let result = Self::is_in_range(&x.start, &first, &second)
+                    || Self::is_in_range(&x.end, &first, &second);
+                result
+            })
+            .map::<WorktimeEntry, _>(move |x| {
+                if x.start >= first && x.end <= second {
                     // trivial case: entry is completely inside the searched range. Return it:
                     return x.clone();
                 }
 
-                let cut_start = if x.start <= first
-                    {
-                        first
-                    }
-                    else 
-                    {
-                        x.start
-                    };
+                let cut_start = if x.start <= first { first } else { x.start };
 
-                let cut_end = if second <= x.end
-                    {
-                        second
-                    }
-                    else 
-                    {
-                        x.end
-                    };
-                WorktimeEntry { start: cut_start, end: cut_end, comments: x.comments.clone() }
+                let cut_end = if second <= x.end { second } else { x.end };
+                WorktimeEntry {
+                    start: cut_start,
+                    end: cut_end,
+                    comments: x.comments.clone(),
+                }
             });
         it
     }
 
-
-    fn get_day_bounds(time: chrono::DateTime<chrono::offset::Local>) -> (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
-    {
+    fn get_day_bounds(
+        time: chrono::DateTime<chrono::offset::Local>,
+    ) -> (
+        chrono::DateTime<chrono::offset::Local>,
+        chrono::DateTime<chrono::offset::Local>,
+    ) {
         let date = chrono::NaiveDate::from_ymd_opt(time.year(), time.month(), time.day()).unwrap();
 
-        let time_start = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
+        let time_start = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
         let time_end = chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
 
-        let day_start = chrono::NaiveDateTime::new(date,time_start);
-        let day_end = chrono::NaiveDateTime::new(date,time_end);
+        let day_start = chrono::NaiveDateTime::new(date, time_start);
+        let day_end = chrono::NaiveDateTime::new(date, time_end);
 
         let local_day_start = Local.from_local_datetime(&day_start).unwrap();
         let local_day_end = Local.from_local_datetime(&day_end).unwrap();
         (local_day_start, local_day_end)
     }
 
-    fn get_week_bounds(time: chrono::DateTime<chrono::offset::Local>) -> (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
-    {
+    fn get_week_bounds(
+        time: chrono::DateTime<chrono::offset::Local>,
+    ) -> (
+        chrono::DateTime<chrono::offset::Local>,
+        chrono::DateTime<chrono::offset::Local>,
+    ) {
         let week = time.iso_week();
 
-        let date_start = chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Mon).unwrap();
-        let date_end = chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Sun).unwrap();
+        let date_start =
+            chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Mon)
+                .unwrap();
+        let date_end =
+            chrono::NaiveDate::from_isoywd_opt(week.year(), week.week(), chrono::Weekday::Sun)
+                .unwrap();
 
-        let time_start = chrono::NaiveTime::from_hms_opt(0,0,0).unwrap();
+        let time_start = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
         let time_end = chrono::NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
 
-        let start = chrono::NaiveDateTime::new(date_start,time_start);
-        let end = chrono::NaiveDateTime::new(date_end,time_end);
+        let start = chrono::NaiveDateTime::new(date_start, time_start);
+        let end = chrono::NaiveDateTime::new(date_end, time_end);
         let local_start = Local.from_local_datetime(&start).unwrap();
         let local_end = Local.from_local_datetime(&end).unwrap();
         (local_start, local_end)
     }
 
-    fn print_simple_summary(self: &Self)
-    {
+    fn print_simple_summary(self: &Self) {
         let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
 
         let mut previous_entry: Option<WorktimeEntry> = None;
         let mut day_sum = chrono::Duration::seconds(0);
-        for entry in 
-            self.query(Self::get_day_bounds(now))
-        {
+        for entry in self.query(Self::get_day_bounds(now)) {
             if let Some(previous_entry) = previous_entry {
                 println!(
                     " {} Pause: {} -> {}",
@@ -288,9 +284,7 @@ impl Database {
         }
 
         let mut week_sum = chrono::Duration::seconds(0);
-        for i in 
-            self.query(Self::get_week_bounds(now))
-        {
+        for i in self.query(Self::get_week_bounds(now)) {
             week_sum = week_sum + i.duration();
         }
 
@@ -301,25 +295,22 @@ impl Database {
         );
     }
 
-
-    fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration
-    {
+    fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration {
         let mut day_sum = chrono::Duration::seconds(0);
-        for entry in 
-            self.query(Self::get_day_bounds(day))
-        {
+        for entry in self.query(Self::get_day_bounds(day)) {
             day_sum = day_sum + entry.duration();
         }
         day_sum
     }
 
-    fn get_day_sums(self: &Self, num_days: u64) -> Vec::<(chrono::DateTime<chrono::offset::Local>, chrono::Duration)>
-    {
+    fn get_day_sums(
+        self: &Self,
+        num_days: u64,
+    ) -> Vec<(chrono::DateTime<chrono::offset::Local>, chrono::Duration)> {
         let mut time: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
 
         let mut result = Vec::new();
-        for _ in 0..num_days
-        {
+        for _ in 0..num_days {
             let bounds = Self::get_day_bounds(time);
             result.push((bounds.1, self.get_day_sum(time)));
             time -= chrono::Duration::hours(24);
@@ -333,9 +324,11 @@ impl Database {
         self: &Self,
         weekly_worktime: chrono::Duration,
         // including start day, excluding end day
-        range: (chrono::DateTime<chrono::offset::Local>, chrono::DateTime<chrono::offset::Local>)
-        ) -> chrono::Duration
-    {
+        range: (
+            chrono::DateTime<chrono::offset::Local>,
+            chrono::DateTime<chrono::offset::Local>,
+        ),
+    ) -> chrono::Duration {
         let (start, end) = range;
 
         let (start_of_today, _) = Self::get_day_bounds(end);
@@ -345,28 +338,24 @@ impl Database {
         // (Will still calculate weekends correctly, though setting the expectation to work mo-fr)
         // i.e. expect each day mo-f: weekly_hours/5 h of work and expect sa-so 0h of work
         let mut total_hours = chrono::Duration::seconds(0);
-        for i in 
-            self.query( (start_of_calculation, start_of_today) )
-        {
+        for i in self.query((start_of_calculation, start_of_today)) {
             total_hours = total_hours + i.duration();
         }
 
         let range = (start_of_today - start_of_calculation).num_days();
-        let weeks = range/7;
-        let days = range-weeks*7;
+        let weeks = range / 7;
+        let days = range - weeks * 7;
         let expected_from_whole_weeks = weekly_worktime * weeks.try_into().unwrap();
 
         // now simulate partial week. We need to do this, as sat and sun do not count as expected
         // work days and we are not aligned with weeks:
         let mut expected_from_partial_weeks = chrono::Duration::seconds(0);
-        let mut day_of_partial_week = (start_of_calculation + chrono::Duration::days(7 * weeks)).weekday();
-        for _ in 0..days
-        {
-            if
-                (day_of_partial_week != chrono::Weekday::Sat) &&
-                (day_of_partial_week != chrono::Weekday::Sun)
+        let mut day_of_partial_week =
+            (start_of_calculation + chrono::Duration::days(7 * weeks)).weekday();
+        for _ in 0..days {
+            if (day_of_partial_week != chrono::Weekday::Sat)
+                && (day_of_partial_week != chrono::Weekday::Sun)
             {
-
                 expected_from_partial_weeks = expected_from_partial_weeks + weekly_worktime / 5;
             }
             day_of_partial_week = day_of_partial_week.succ();
@@ -374,20 +363,19 @@ impl Database {
 
         // now calculate bonus hours received from special days:
         let mut special_days_bonus_time = chrono::Duration::seconds(0);
-        for i in 
-            self.query_special_days( (start_of_calculation, start_of_today) )
-        {
+        for i in self.query_special_days((start_of_calculation, start_of_today)) {
             // weekends cannot have special days:
-            match i.day.weekday()
-            {
+            match i.day.weekday() {
                 chrono::Weekday::Sat => (),
                 chrono::Weekday::Sun => (),
-                _ => { special_days_bonus_time = special_days_bonus_time + weekly_worktime / 5; }
+                _ => {
+                    special_days_bonus_time = special_days_bonus_time + weekly_worktime / 5;
+                }
             }
         }
 
-
-        return total_hours - expected_from_whole_weeks - expected_from_partial_weeks + special_days_bonus_time;
+        return total_hours - expected_from_whole_weeks - expected_from_partial_weeks
+            + special_days_bonus_time;
     }
 }
 
@@ -455,8 +443,7 @@ impl ActivityRecorder {
     }
 }
 
-fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
-{
+fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) {
     let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(
         database.clone(),
         cfg.timeout_minutes,
@@ -479,11 +466,7 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
                 .unwrap()
                 .handle_event(EventType::Commit);
             println!("Saving worktimes into data file...");
-            database_signals
-                .lock()
-                .unwrap()
-                .store_file()
-                .unwrap();
+            database_signals.lock().unwrap().store_file().unwrap();
             // lock mutex here, which prevents any auto-save to try saving while we exit
             let _lock = file_mutex_signal.lock();
             std::process::exit(0);
@@ -507,25 +490,19 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
     let database_autosave = database.clone();
     let auto_save_interval_seconds = cfg.auto_save_interval_seconds.clone();
     thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(
-            auto_save_interval_seconds,
-        ));
+        thread::sleep(std::time::Duration::from_secs(auto_save_interval_seconds));
         println!("Auto-Save");
         let _lock = file_mutex_auto_save.lock();
-        database_autosave
-            .lock()
-            .unwrap()
-            .store_file()
-            .unwrap();
+        database_autosave.lock().unwrap().store_file().unwrap();
     });
 
     // monitor terminal input:
     // TODO
-    let overtime_end : chrono::DateTime<chrono::offset::Local> =  std::time::SystemTime::now().into();
+    let overtime_end: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
     let overtime = database.lock().unwrap().calculate_overtime(
         chrono::Duration::hours(cfg.weekly_hours),
-        (cfg.cutoff_datetime, overtime_end)
-        );
+        (cfg.cutoff_datetime, overtime_end),
+    );
     println!("overtime: {}", format_chrono_duration(&overtime));
 
     loop {
@@ -543,7 +520,6 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config)
         //database.lock().unwrap().print_summary(day_start, day_end);
         database.lock().unwrap().print_simple_summary();
     }
-
 }
 use clap::Parser;
 #[derive(Parser, Debug)]
@@ -553,7 +529,7 @@ struct Args {
     #[clap(long, short, action)]
     overtime: bool,
     #[clap(long, short, action)]
-    daysums: Option<u64>
+    daysums: Option<u64>,
 }
 
 fn main() {
@@ -566,303 +542,398 @@ fn main() {
     let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
     println!("Using special_day file {}", special_day_path.display());
 
-    let database = Arc::new(Mutex::new(Database::init(data_path, special_day_path).unwrap()));
-    if args.overtime
-    {
-        let overtime_end : chrono::DateTime<chrono::offset::Local> =  std::time::SystemTime::now().into();
+    let database = Arc::new(Mutex::new(
+        Database::init(data_path, special_day_path).unwrap(),
+    ));
+    if args.overtime {
+        let overtime_end: chrono::DateTime<chrono::offset::Local> =
+            std::time::SystemTime::now().into();
         let overtime = database.lock().unwrap().calculate_overtime(
             chrono::Duration::hours(cfg.weekly_hours),
-            (cfg.cutoff_datetime, overtime_end)
-            );
+            (cfg.cutoff_datetime, overtime_end),
+        );
         println!("overtime: {}", format_chrono_duration(&overtime));
-    }
-    else if let Some(days) = args.daysums
-    {
+    } else if let Some(days) = args.daysums {
         let daysums = database.lock().unwrap().get_day_sums(days);
-        for (time, sum) in daysums
-        {
-            println!("{}: {}", time.format("%a %Y-%m-%d") , format_chrono_duration(&sum));
+        for (time, sum) in daysums {
+            println!(
+                "{}: {}",
+                time.format("%a %Y-%m-%d"),
+                format_chrono_duration(&sum)
+            );
         }
-    }
-    else {
+    } else {
         // No two processes are allowed to monitor worktime at the same time.
         // It would lead to races in writing database file.
         let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
         {
-        if let Ok(_guard) = monitoring_lock.try_lock()
-        {
-            run_interactive_monitoring(database, &cfg);
-        }
-        else {
-            println!("Another process is already monitoring worktime. exiting...")
-        }
+            if let Ok(_guard) = monitoring_lock.try_lock() {
+                run_interactive_monitoring(database, &cfg);
+            } else {
+                println!("Another process is already monitoring worktime. exiting...")
+            }
         };
     }
 }
 
 #[test]
-fn test_overtime_empty_db_empty_range()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-01T00:00:00.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-01T00:00:00.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_empty_range() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-01T00:00:00.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-01T00:00:00.00+02:00".parse().unwrap();
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(0));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(0)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_weekday()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-02T00:00:00.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-04T00:00:00.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_weekday() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-02T00:00:00.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-04T00:00:00.00+02:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-16));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-16)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_weekend()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-05T00:00:00.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-07T00:00:00.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_weekend() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-05T00:00:00.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-07T00:00:00.00+02:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-8));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-8)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_only_weekend()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-06T00:00:00.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-08T00:00:00.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_only_weekend() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-06T00:00:00.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-08T00:00:00.00+02:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(0));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(0)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_full_week()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-17T00:00:00.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-24T00:00:00.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_full_week() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-17T00:00:00.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-24T00:00:00.00+02:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-40));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-40)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_full_week_not_0_clock()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-05-17T16:22:12.00+02:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-05-24T02:01:08.00+02:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_full_week_not_0_clock() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-17T16:22:12.00+02:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-05-24T02:01:08.00+02:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-40));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-40)
+    );
 }
 
 #[test]
-fn test_overtime_empty_db_valid_range_full_year()
-{
-    let db = Database{rows: vec!(), special_days: vec!()};
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2024-01-01T00:00:00.00+01:00".parse().unwrap();
+fn test_overtime_empty_db_valid_range_full_year() {
+    let db = Database {
+        rows: vec![],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2024-01-01T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-2080));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-2080)
+    );
 }
 
 #[test]
-fn test_overtime_single_entry_worked_sunday()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
-                start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
-                end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!()
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+fn test_overtime_single_entry_worked_sunday() {
+    let db = Database {
+        rows: vec![WorktimeEntry {
+            start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
+            end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
+            comments: "".into(),
+        }],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(-7));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(-7)
+    );
 }
 
 #[test]
-fn test_overtime_single_entry_worked_monday_full()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
+fn test_overtime_single_entry_worked_monday_full() {
+    let db = Database {
+        rows: vec![WorktimeEntry {
+            start: "2023-01-02T08:00:00.00+01:00".parse().unwrap(),
+            end: "2023-01-02T16:00:00.00+01:00".parse().unwrap(),
+            comments: "".into(),
+        }],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+
+    let weekly_hours = chrono::Duration::hours(40);
+
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(0)
+    );
+}
+
+#[test]
+fn test_overtime_single_entry_worked_monday_overtime() {
+    let db = Database {
+        rows: vec![
+            WorktimeEntry {
                 start: "2023-01-02T08:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-02T16:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!()
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
-
-    let weekly_hours = chrono::Duration::hours(40);
-
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(0));
-}
-
-#[test]
-fn test_overtime_single_entry_worked_monday_overtime()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
-                start: "2023-01-02T08:00:00.00+01:00".parse().unwrap(),
-                end: "2023-01-02T16:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
+                comments: "".into(),
             },
-            WorktimeEntry{
+            WorktimeEntry {
                 start: "2023-01-02T17:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-02T17:15:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!()
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+                comments: "".into(),
+            },
+        ],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(0) + chrono::Duration::minutes(15));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(0) + chrono::Duration::minutes(15)
+    );
 }
 
 #[test]
-fn test_overtime_single_entry_worked_out_of_range()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
+fn test_overtime_single_entry_worked_out_of_range() {
+    let db = Database {
+        rows: vec![
+            WorktimeEntry {
                 start: "2023-01-02T08:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-02T16:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
+                comments: "".into(),
             },
-            WorktimeEntry{
+            WorktimeEntry {
                 start: "2023-01-03T17:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-03T17:15:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!()
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+                comments: "".into(),
+            },
+        ],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(0));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(0)
+    );
 }
 
 #[test]
-fn test_overtime_single_entry_worked_over_midnight_and_a_wohle_year()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
+fn test_overtime_single_entry_worked_over_midnight_and_a_wohle_year() {
+    let db = Database {
+        rows: vec![
+            WorktimeEntry {
                 start: "2022-01-02T08:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-01T08:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
+                comments: "".into(),
             },
-            WorktimeEntry{
+            WorktimeEntry {
                 start: "2023-01-02T23:00:00.00+01:00".parse().unwrap(),
                 end: "2023-01-03T01:15:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!()
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+                comments: "".into(),
+            },
+        ],
+        special_days: vec![],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(1));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(1)
+    );
 }
 
 #[test]
-fn test_overtime_special_day()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
-                start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
-                end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!(
-                SpecialDayEntry{ day: "2023-01-02".parse().unwrap(), day_type: SpecialDayType::Vacation}
-                )
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+fn test_overtime_special_day() {
+    let db = Database {
+        rows: vec![WorktimeEntry {
+            start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
+            end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
+            comments: "".into(),
+        }],
+        special_days: vec![SpecialDayEntry {
+            day: "2023-01-02".parse().unwrap(),
+            day_type: SpecialDayType::Vacation,
+        }],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(1));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(1)
+    );
 }
 
 #[test]
-fn test_overtime_special_day_sunday()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
-                start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
-                end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!(
-                SpecialDayEntry{ day: "2023-01-01".parse().unwrap(), day_type: SpecialDayType::Vacation},
-                SpecialDayEntry{ day: "2023-01-02".parse().unwrap(), day_type: SpecialDayType::Vacation}
-                )
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+fn test_overtime_special_day_sunday() {
+    let db = Database {
+        rows: vec![WorktimeEntry {
+            start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
+            end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
+            comments: "".into(),
+        }],
+        special_days: vec![
+            SpecialDayEntry {
+                day: "2023-01-01".parse().unwrap(),
+                day_type: SpecialDayType::Vacation,
+            },
+            SpecialDayEntry {
+                day: "2023-01-02".parse().unwrap(),
+                day_type: SpecialDayType::Vacation,
+            },
+        ],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(1));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(1)
+    );
 }
 
 #[test]
-fn test_overtime_special_day_out_range()
-{
-    let db = Database{rows: vec!(
-            WorktimeEntry{
-                start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
-                end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
-                comments: "".into()
-            }
-            ),
-            special_days: vec!(
-                SpecialDayEntry{ day: "2022-12-20".parse().unwrap(), day_type: SpecialDayType::Vacation},
-                SpecialDayEntry{ day: "2023-01-02".parse().unwrap(), day_type: SpecialDayType::Vacation},
-                SpecialDayEntry{ day: "2023-01-03".parse().unwrap(), day_type: SpecialDayType::Vacation}
-                )
-        };
-    let start : chrono::DateTime<chrono::offset::Local> = "2023-01-01T00:00:00.00+01:00".parse().unwrap();
-    let end : chrono::DateTime<chrono::offset::Local> = "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+fn test_overtime_special_day_out_range() {
+    let db = Database {
+        rows: vec![WorktimeEntry {
+            start: "2023-01-01T00:00:00.00+01:00".parse().unwrap(),
+            end: "2023-01-01T01:00:00.00+01:00".parse().unwrap(),
+            comments: "".into(),
+        }],
+        special_days: vec![
+            SpecialDayEntry {
+                day: "2022-12-20".parse().unwrap(),
+                day_type: SpecialDayType::Vacation,
+            },
+            SpecialDayEntry {
+                day: "2023-01-02".parse().unwrap(),
+                day_type: SpecialDayType::Vacation,
+            },
+            SpecialDayEntry {
+                day: "2023-01-03".parse().unwrap(),
+                day_type: SpecialDayType::Vacation,
+            },
+        ],
+    };
+    let start: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-01T00:00:00.00+01:00".parse().unwrap();
+    let end: chrono::DateTime<chrono::offset::Local> =
+        "2023-01-03T00:00:00.00+01:00".parse().unwrap();
 
     let weekly_hours = chrono::Duration::hours(40);
 
-    assert_eq!(db.calculate_overtime(weekly_hours, (start, end)), chrono::Duration::hours(1));
+    assert_eq!(
+        db.calculate_overtime(weekly_hours, (start, end)),
+        chrono::Duration::hours(1)
+    );
 }
