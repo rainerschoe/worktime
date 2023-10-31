@@ -346,13 +346,21 @@ impl Database {
         let weeks = range / 7;
         let days = range - weeks * 7;
         let expected_from_whole_weeks = weekly_worktime * weeks.try_into().unwrap();
+        println!("days: {}", days);
 
         // now simulate partial week. We need to do this, as sat and sun do not count as expected
         // work days and we are not aligned with weeks:
         let mut expected_from_partial_weeks = chrono::Duration::seconds(0);
+        // NOTE: using checked_add_days here, as it really adds days. a day is not always the same length (e.g. during daylight saving transition)
         let mut day_of_partial_week =
-            (start_of_calculation + chrono::Duration::days(7 * weeks)).weekday();
+            (start_of_calculation.checked_add_days(
+                chrono::naive::Days::new(
+                    (7 * weeks) as u64
+                )
+                ).unwrap()
+            ).weekday();
         for _ in 0..days {
+            println!(" dopw {}", day_of_partial_week);
             if (day_of_partial_week != chrono::Weekday::Sat)
                 && (day_of_partial_week != chrono::Weekday::Sun)
             {
@@ -360,6 +368,7 @@ impl Database {
             }
             day_of_partial_week = day_of_partial_week.succ();
         }
+        println!("expected partial week: {}", format_chrono_duration(&expected_from_partial_weeks));
 
         // now calculate bonus hours received from special days:
         let mut special_days_bonus_time = chrono::Duration::seconds(0);
@@ -370,6 +379,7 @@ impl Database {
                 chrono::Weekday::Sun => (),
                 _ => {
                     special_days_bonus_time = special_days_bonus_time + weekly_worktime / 5;
+                    println!("bonus from {:#?}: {}", i, format_chrono_duration(&special_days_bonus_time));
                 }
             }
         }
