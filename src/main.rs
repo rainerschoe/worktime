@@ -587,6 +587,8 @@ fn test_overtime_empty_db_empty_range() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-01T00:00:00.00+02:00".parse().unwrap();
@@ -605,6 +607,8 @@ fn test_overtime_empty_db_valid_range_weekday() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-02T00:00:00.00+02:00".parse().unwrap();
@@ -624,6 +628,8 @@ fn test_overtime_empty_db_valid_range_weekend() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-05T00:00:00.00+02:00".parse().unwrap();
@@ -643,6 +649,8 @@ fn test_overtime_empty_db_valid_range_only_weekend() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-06T00:00:00.00+02:00".parse().unwrap();
@@ -662,6 +670,8 @@ fn test_overtime_empty_db_valid_range_full_week() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-17T00:00:00.00+02:00".parse().unwrap();
@@ -681,6 +691,8 @@ fn test_overtime_empty_db_valid_range_full_week_not_0_clock() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-05-17T16:22:12.00+02:00".parse().unwrap();
@@ -700,6 +712,8 @@ fn test_overtime_empty_db_valid_range_full_year() {
     let db = Database {
         rows: vec![],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -723,6 +737,8 @@ fn test_overtime_single_entry_worked_sunday() {
             comments: "".into(),
         }],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -746,6 +762,8 @@ fn test_overtime_single_entry_worked_monday_full() {
             comments: "".into(),
         }],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -776,6 +794,8 @@ fn test_overtime_single_entry_worked_monday_overtime() {
             },
         ],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -806,6 +826,8 @@ fn test_overtime_single_entry_worked_out_of_range() {
             },
         ],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -836,6 +858,8 @@ fn test_overtime_single_entry_worked_over_midnight_and_a_wohle_year() {
             },
         ],
         special_days: vec![],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -862,6 +886,8 @@ fn test_overtime_special_day() {
             day: "2023-01-02".parse().unwrap(),
             day_type: SpecialDayType::Vacation,
         }],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -894,6 +920,8 @@ fn test_overtime_special_day_sunday() {
                 day_type: SpecialDayType::Vacation,
             },
         ],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
@@ -930,6 +958,8 @@ fn test_overtime_special_day_out_range() {
                 day_type: SpecialDayType::Vacation,
             },
         ],
+        path: std::path::PathBuf::new(),
+        file_access_lock: named_lock::NamedLock::create("dummy").unwrap(),
     };
     let start: chrono::DateTime<chrono::offset::Local> =
         "2023-01-01T00:00:00.00+01:00".parse().unwrap();
