@@ -561,11 +561,45 @@ fn main() {
         println!("overtime: {}", format_chrono_duration(&overtime));
     } else if let Some(days) = args.daysums {
         let daysums = database.lock().unwrap().get_day_sums(days);
+        let expected_per_day = chrono::Duration::hours(cfg.weekly_hours / 5);
+        let db = database.lock().unwrap();
         for (time, sum) in daysums {
+            let weekday = time.weekday();
+            // Check for special day (Vacation, Sick, Holiday)
+            let special = db.special_days.iter().find(|sd| {
+                sd.day == time.date_naive() && matches!(sd.day_type, SpecialDayType::Vacation | SpecialDayType::Sick | SpecialDayType::Holiday)
+            });
+            let expected = match (weekday, special) {
+                (chrono::Weekday::Sat | chrono::Weekday::Sun, _) => chrono::Duration::zero(),
+                (_, Some(_)) => chrono::Duration::zero(),
+                _ => expected_per_day,
+            };
+            let deviation = sum - expected;
+            let deviation_secs = deviation.num_seconds();
+            let color = if deviation_secs > 0 {
+                "\x1b[32m" // green
+            } else if deviation_secs < -3*60*60 {
+                "\x1b[31m" // red
+            } else if deviation_secs < -1*60*60 {
+                "\x1b[38;5;208m" // orange
+            } else {
+                "\x1b[33m" // yellow
+            };
+            let mut reason = String::new();
+            if expected == chrono::Duration::zero() {
+                if let Some(s) = special {
+                    reason = format!(" ({:?})", s.day_type);
+                } else if matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun) {
+                    reason = " (Weekend)".to_string();
+                }
+            }
             println!(
-                "{}: {}",
+                "{}: {}  deviation: {}{}\x1b[0m{}",
                 time.format("%a %Y-%m-%d"),
-                format_chrono_duration(&sum)
+                format_chrono_duration(&sum),
+                color,
+                format_chrono_duration(&deviation),
+                reason
             );
         }
     } else {
