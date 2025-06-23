@@ -561,7 +561,9 @@ fn main() {
         println!("overtime: {}", format_chrono_duration(&overtime));
     } else if let Some(days) = args.daysums {
         let daysums = database.lock().unwrap().get_day_sums(days);
-        let expected_per_day = chrono::Duration::hours(cfg.weekly_hours / 5);
+        // Use floating-point division for accurate expected_per_day
+        let expected_per_day_secs = (cfg.weekly_hours as f64 / 5.0) * 3600.0;
+        let expected_per_day = chrono::Duration::seconds(expected_per_day_secs.round() as i64);
         let db = database.lock().unwrap();
         for (time, sum) in daysums {
             let weekday = time.weekday();
