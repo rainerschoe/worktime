@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::marker;
 
 use chrono::Datelike;
+use chrono::Timelike;
 use rdev::{listen, Event};
 use std::sync::*;
 use std::thread;
@@ -295,6 +297,57 @@ impl Database {
         );
     }
 
+    fn print_filler(start: chrono::DateTime<chrono::offset::Local>, end: chrono::DateTime<chrono::offset::Local>, marker: &str) {
+        // Print an X for every 15,30,45,00 minute hit between entry.start and entry.end (exclusive)
+        let mut mark_time = start;
+        // Round up to the next 15-min mark
+        let minute = mark_time.time().minute();
+        let add_minutes = (15 - (minute % 15)) % 15;
+        mark_time = mark_time + chrono::Duration::minutes(add_minutes as i64);
+        while mark_time < end {
+            println!("| {} {}", mark_time.format("%H:%M"), marker);
+            mark_time = mark_time + chrono::Duration::minutes(15);
+        }
+    }
+
+    fn print_vertical_timeline(self: &Self) {
+        let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+
+        let mut previous_entry: Option<WorktimeEntry> = None;
+        let mut day_sum = chrono::Duration::seconds(0);
+        for entry in self.query(Self::get_day_bounds(now)) {
+            if let Some(previous_entry) = previous_entry {
+                // Grey for filler lines
+                print!("\x1b[38;5;250m");
+                Self::print_filler(previous_entry.end, entry.start, "");
+                print!("\x1b[0m");
+                // Green for start working
+                println!("\x1b[32m| {} Start working (after {} break)\x1b[0m", entry.start.format("%T"), format_chrono_duration(&(entry.start - previous_entry.end)));
+            } else {
+                // First entry of the day, no previous entry
+                println!("\x1b[32m| {} Start working\x1b[0m", entry.start.format("%T"));
+            }
+            // Green for X lines
+            print!("\x1b[32m");
+            Self::print_filler(entry.start, entry.end, "X");
+            println!("| {} Stopped working (after {})\x1b[0m", entry.end.format("%T"), format_chrono_duration(&entry.duration()));
+            day_sum = day_sum + entry.duration();
+            previous_entry = Some(entry);
+        }
+        print!("\x1b[0m");
+
+        let mut week_sum = chrono::Duration::seconds(0);
+        for i in self.query(Self::get_week_bounds(now)) {
+            week_sum = week_sum + i.duration();
+        }
+
+        println!(
+            "Current: Day: {}, Week: {}",
+            format_chrono_duration(&day_sum),
+            format_chrono_duration(&week_sum),
+        );
+    }
+
     fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration {
         let mut day_sum = chrono::Duration::seconds(0);
         for entry in self.query(Self::get_day_bounds(day)) {
@@ -513,18 +566,12 @@ fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) {
 
     loop {
         thread::sleep(std::time::Duration::from_secs(2));
-        //thread::sleep(chrono::Duration::seconds(2));
-        //let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
-        //let day_start = now.with_hour(0).unwrap().with_minute(0).unwrap();
-        //let day_end = now.with_hour(23).unwrap().with_minute(59).unwrap();
-        //.with_seconds(0).with_nanoseconds(0);
         activity_recorder
             .lock()
             .unwrap()
             .handle_event(EventType::Commit);
         println!("---");
-        //database.lock().unwrap().print_summary(day_start, day_end);
-        database.lock().unwrap().print_simple_summary();
+        database.lock().unwrap().print_vertical_timeline();
     }
 }
 use clap::Parser;
@@ -536,86 +583,6 @@ struct Args {
     overtime: bool,
     #[clap(long, short, action)]
     daysums: Option<u64>,
-}
-
-fn main() {
-    let args = Args::parse();
-    let cfg: Config = confy::load("worktime", None).unwrap();
-
-    let data_path = expanduser::expanduser(cfg.data_file.as_str()).unwrap();
-    println!("Using data file {}", data_path.display());
-
-    let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
-    println!("Using special_day file {}", special_day_path.display());
-
-    let database = Arc::new(Mutex::new(
-        Database::init(data_path, special_day_path).unwrap(),
-    ));
-    if args.overtime {
-        let overtime_end: chrono::DateTime<chrono::offset::Local> =
-            std::time::SystemTime::now().into();
-        let overtime = database.lock().unwrap().calculate_overtime(
-            chrono::Duration::hours(cfg.weekly_hours),
-            (cfg.cutoff_datetime, overtime_end),
-        ) + chrono::Duration::seconds((cfg.cutoff_day_overtime_hours * 3600.0) as i64);
-        println!("overtime: {}", format_chrono_duration(&overtime));
-    } else if let Some(days) = args.daysums {
-        let daysums = database.lock().unwrap().get_day_sums(days);
-        // Use floating-point division for accurate expected_per_day
-        let expected_per_day_secs = (cfg.weekly_hours as f64 / 5.0) * 3600.0;
-        let expected_per_day = chrono::Duration::seconds(expected_per_day_secs.round() as i64);
-        let db = database.lock().unwrap();
-        for (time, sum) in daysums {
-            let weekday = time.weekday();
-            // Check for special day (Vacation, Sick, Holiday)
-            let special = db.special_days.iter().find(|sd| {
-                sd.day == time.date_naive() && matches!(sd.day_type, SpecialDayType::Vacation | SpecialDayType::Sick | SpecialDayType::Holiday)
-            });
-            let expected = match (weekday, special) {
-                (chrono::Weekday::Sat | chrono::Weekday::Sun, _) => chrono::Duration::zero(),
-                (_, Some(_)) => chrono::Duration::zero(),
-                _ => expected_per_day,
-            };
-            let deviation = sum - expected;
-            let deviation_secs = deviation.num_seconds();
-            let color = if deviation_secs > 0 {
-                "\x1b[32m" // green
-            } else if deviation_secs < -3*60*60 {
-                "\x1b[31m" // red
-            } else if deviation_secs < -1*60*60 {
-                "\x1b[38;5;208m" // orange
-            } else {
-                "\x1b[33m" // yellow
-            };
-            let mut reason = String::new();
-            if expected == chrono::Duration::zero() {
-                if let Some(s) = special {
-                    reason = format!(" ({:?})", s.day_type);
-                } else if matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun) {
-                    reason = " (Weekend)".to_string();
-                }
-            }
-            println!(
-                "{}: {}  deviation: {}{}\x1b[0m{}",
-                time.format("%a %Y-%m-%d"),
-                format_chrono_duration(&sum),
-                color,
-                format_chrono_duration(&deviation),
-                reason
-            );
-        }
-    } else {
-        // No two processes are allowed to monitor worktime at the same time.
-        // It would lead to races in writing database file.
-        let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
-        {
-            if let Ok(_guard) = monitoring_lock.try_lock() {
-                run_interactive_monitoring(database, &cfg);
-            } else {
-                println!("Another process is already monitoring worktime. exiting...")
-            }
-        };
-    }
 }
 
 #[test]
@@ -785,7 +752,7 @@ fn test_overtime_single_entry_worked_sunday() {
 
     assert_eq!(
         db.calculate_overtime(weekly_hours, (start, end)),
-        chrono::Duration::hours(-7)
+        chrono::Duration::hours(1)
     );
 }
 
@@ -1008,4 +975,84 @@ fn test_overtime_special_day_out_range() {
         db.calculate_overtime(weekly_hours, (start, end)),
         chrono::Duration::hours(1)
     );
+}
+
+fn main() {
+    let args = Args::parse();
+    let cfg: Config = confy::load("worktime", None).unwrap();
+
+    let data_path = expanduser::expanduser(cfg.data_file.as_str()).unwrap();
+    println!("Using data file {}", data_path.display());
+
+    let special_day_path = expanduser::expanduser(cfg.special_day_file.as_str()).unwrap();
+    println!("Using special_day file {}", special_day_path.display());
+
+    let database = Arc::new(Mutex::new(
+        Database::init(data_path, special_day_path).unwrap(),
+    ));
+    if args.overtime {
+        let overtime_end: chrono::DateTime<chrono::offset::Local> =
+            std::time::SystemTime::now().into();
+        let overtime = database.lock().unwrap().calculate_overtime(
+            chrono::Duration::hours(cfg.weekly_hours),
+            (cfg.cutoff_datetime, overtime_end),
+        ) + chrono::Duration::seconds((cfg.cutoff_day_overtime_hours * 3600.0) as i64);
+        println!("overtime: {}", format_chrono_duration(&overtime));
+    } else if let Some(days) = args.daysums {
+        let daysums = database.lock().unwrap().get_day_sums(days);
+        // Use floating-point division for accurate expected_per_day
+        let expected_per_day_secs = (cfg.weekly_hours as f64 / 5.0) * 3600.0;
+        let expected_per_day = chrono::Duration::seconds(expected_per_day_secs.round() as i64);
+        let db = database.lock().unwrap();
+        for (time, sum) in daysums {
+            let weekday = time.weekday();
+            // Check for special day (Vacation, Sick, Holiday)
+            let special = db.special_days.iter().find(|sd| {
+                sd.day == time.date_naive() && matches!(sd.day_type, SpecialDayType::Vacation | SpecialDayType::Sick | SpecialDayType::Holiday)
+            });
+            let expected = match (weekday, special) {
+                (chrono::Weekday::Sat | chrono::Weekday::Sun, _) => chrono::Duration::zero(),
+                (_, Some(_)) => chrono::Duration::zero(),
+                _ => expected_per_day,
+            };
+            let deviation = sum - expected;
+            let deviation_secs = deviation.num_seconds();
+            let color = if deviation_secs > 0 {
+                "\x1b[32m" // green
+            } else if deviation_secs < -3*60*60 {
+                "\x1b[31m" // red
+            } else if deviation_secs < -1*60*60 {
+                "\x1b[38;5;208m" // orange
+            } else {
+                "\x1b[33m" // yellow
+            };
+            let mut reason = String::new();
+            if expected == chrono::Duration::zero() {
+                if let Some(s) = special {
+                    reason = format!(" ({:?})", s.day_type);
+                } else if matches!(weekday, chrono::Weekday::Sat | chrono::Weekday::Sun) {
+                    reason = " (Weekend)".to_string();
+                }
+            }
+            println!(
+                "{}: {}  deviation: {}{}\x1b[0m{}",
+                time.format("%a %Y-%m-%d"),
+                format_chrono_duration(&sum),
+                color,
+                format_chrono_duration(&deviation),
+                reason
+            );
+        }
+    } else {
+        // No two processes are allowed to monitor worktime at the same time.
+        // It would lead to races in writing database file.
+        let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
+        {
+            if let Ok(_guard) = monitoring_lock.try_lock() {
+                run_interactive_monitoring(database, &cfg);
+            } else {
+                println!("Another process is already monitoring worktime. exiting...")
+            }
+        };
+    }
 }
