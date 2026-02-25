@@ -536,7 +536,7 @@ mod tests {
         let start: chrono::DateTime<chrono::offset::Local> =
             "2023-01-01T00:00:00.00+01:00".parse().unwrap();
         let end: chrono::DateTime<chrono::offset::Local> =
-            "2023-01-03T00:00:00.00+01:00".parse().unwrap();
+            "2023-01-02T07:00:00.00+01:00".parse().unwrap();
 
         let weekly_hours = chrono::Duration::hours(40);
 
