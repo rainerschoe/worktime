@@ -2,6 +2,12 @@
 name = "worktime"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "test_idle_evdev"
+path = "test_idle_evdev.rs"
+
+[package.metadata]
 license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -16,6 +22,11 @@ expanduser = { version = "1.2"}
 confy = "0.5"
 named-lock = "0.3"
 clap = { version = "4.3.19", features = ["derive"] }
+
+# Linux-specific dependencies for idle detection
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+evdev = "0.12"
 
 [dev-dependencies]
 cargo-tarpaulin = "0.18.0"

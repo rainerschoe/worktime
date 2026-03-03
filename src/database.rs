@@ -281,6 +281,77 @@ impl Database {
         );
     }
 
+    /// Like print_vertical_timeline but also shows the current in-progress session.
+    ///
+    /// # Arguments
+    /// * `current_session_start` - Start time of the current in-progress session (if any)
+    pub fn print_vertical_timeline_with_current(
+        &self,
+        current_session_start: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        let now: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+
+        let mut previous_entry: Option<WorktimeEntry> = None;
+        let mut day_sum = chrono::Duration::seconds(0);
+        for entry in self.query(Self::get_day_bounds(now)) {
+            if let Some(previous_entry) = previous_entry {
+                print!("\x1b[38;5;250m");
+                Self::print_filler(previous_entry.end, entry.start, "");
+                print!("\x1b[0m");
+                println!("\x1b[32m| {} Start working (after {} break)\x1b[0m", entry.start.format("%T"), format_chrono_duration(&(entry.start - previous_entry.end)));
+            } else {
+                println!("\x1b[32m| {} Start working\x1b[0m", entry.start.format("%T"));
+            }
+            print!("\x1b[32m");
+            Self::print_filler(entry.start, entry.end, "X");
+            println!("| {} Stopped working (after {})\x1b[0m", entry.end.format("%T"), format_chrono_duration(&entry.duration()));
+            day_sum = day_sum + entry.duration();
+            previous_entry = Some(entry);
+        }
+        print!("\x1b[0m");
+
+        // Show current in-progress session
+        if let Some(session_start) = current_session_start {
+            let current_duration = now - session_start;
+            // Only show if session started today
+            let (day_start, _) = Self::get_day_bounds(now);
+            if session_start >= day_start {
+                if let Some(prev) = previous_entry {
+                    print!("\x1b[38;5;250m");
+                    Self::print_filler(prev.end, session_start, "");
+                    print!("\x1b[0m");
+                    println!("\x1b[32m| {} Start working (after {} break)\x1b[0m",
+                        session_start.format("%T"),
+                        format_chrono_duration(&(session_start - prev.end)));
+                } else {
+                    println!("\x1b[32m| {} Start working\x1b[0m", session_start.format("%T"));
+                }
+                print!("\x1b[33m"); // Yellow for in-progress
+                Self::print_filler(session_start, now, "~");
+                println!("| {} Working... ({})\x1b[0m", now.format("%T"), format_chrono_duration(&current_duration));
+                day_sum = day_sum + current_duration;
+            }
+        }
+
+        let mut week_sum = chrono::Duration::seconds(0);
+        for i in self.query(Self::get_week_bounds(now)) {
+            week_sum = week_sum + i.duration();
+        }
+        // Add current session to week sum too
+        if let Some(session_start) = current_session_start {
+            let (week_start, _) = Self::get_week_bounds(now);
+            if session_start >= week_start {
+                week_sum = week_sum + (now - session_start);
+            }
+        }
+
+        println!(
+            "Current: Day: {}, Week: {}",
+            format_chrono_duration(&day_sum),
+            format_chrono_duration(&week_sum),
+        );
+    }
+
     pub fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration {
         let mut day_sum = chrono::Duration::seconds(0);
         for entry in self.query(Self::get_day_bounds(day)) {
