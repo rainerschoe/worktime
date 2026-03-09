@@ -84,9 +84,27 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
         println!("---");
         
         // Get current in-progress session from the idle detector to show live duration
-        let current_session = idle_detector_ref.lock().unwrap().get_current_session();
+        let detector = idle_detector_ref.lock().unwrap();
+        let current_session = detector.get_current_session();
         let current_start = current_session.map(|s| s.start);
         
+        // Get idle duration for live activity status
+        let idle_duration = detector.get_idle_duration();
+        drop(detector); // Release lock before printing
+        
         database.lock().unwrap().print_vertical_timeline_with_current(current_start);
+        
+        // Display live activity state AFTER the timeline
+        if let Some(idle_dur) = idle_duration {
+            let idle_secs = idle_dur.num_seconds();
+            if idle_secs < 60 {
+                println!("Active ({}s since last input)", idle_secs);
+            } else {
+                let idle_mins = idle_secs / 60;
+                println!("Idle for {}m {}s", idle_mins, idle_secs % 60);
+            }
+        } else {
+            println!("No activity detected yet");
+        }
     }
 }
