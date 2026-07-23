@@ -18,7 +18,10 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
 
     // Create platform-specific idle detector and start monitoring
     let mut idle_detector = create_idle_detector(cfg.timeout_minutes)
-        .expect("Failed to create idle detector");
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create idle detector:\n{}", e);
+            std::process::exit(1);
+        });
     
     // Start idle detection monitoring
     let activity_recorder_monitor = activity_recorder.clone();
