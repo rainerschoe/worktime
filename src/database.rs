@@ -2,6 +2,7 @@ use std::error::Error;
 use chrono::Datelike;
 use chrono::Timelike;
 use chrono::{offset::TimeZone, Local};
+#[allow(unused_imports)]
 use crate::models::{WorktimeEntry, SpecialDayEntry, SpecialDayType};
 use crate::utils::format_chrono_duration;
 
@@ -19,6 +20,13 @@ impl Database {
             self.rows.pop();
         }
         self.rows.push(entry);
+    }
+
+    /// Insert a worktime entry in chronological order (by start time).
+    /// Used when retroactively adding an idle gap as work time.
+    pub fn insert_sorted(self: &mut Self, entry: WorktimeEntry) {
+        let pos = self.rows.partition_point(|r| r.start <= entry.start);
+        self.rows.insert(pos, entry);
     }
 
     pub fn init(

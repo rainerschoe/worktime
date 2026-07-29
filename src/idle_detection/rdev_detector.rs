@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 use rdev::{listen, Event};
-use super::{IdleDetector, WorkSession, SessionCallback};
+use super::{IdleDetector, WorkSession, SessionCallback, SessionStartCallback};
 
 /// Idle detector using rdev for input event monitoring
 pub struct RdevIdleDetector {
@@ -30,50 +30,48 @@ impl RdevIdleDetector {
 }
 
 impl IdleDetector for RdevIdleDetector {
-    fn start_monitoring(&mut self, callback: SessionCallback) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_monitoring(
+        &mut self,
+        on_session_end: SessionCallback,
+        on_session_start: SessionStartCallback,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let timeout_minutes = self.timeout_minutes;
-        let callback = Arc::new(Mutex::new(callback));
+        let on_session_end   = Arc::new(Mutex::new(on_session_end));
+        let on_session_start = Arc::new(Mutex::new(on_session_start));
         let session_start = self.session_start.clone();
         let last_activity = self.last_activity.clone();
-        
+
         // Initialize with current time
         let now = chrono::Local::now();
         *session_start.lock().unwrap() = Some(now);
         *last_activity.lock().unwrap() = Some(now);
-        
+        on_session_start.lock().unwrap()(now);
+
         // Start listening to input events
         thread::spawn(move || {
             if let Err(error) = listen(move |event: Event| {
                 let event_time: chrono::DateTime<chrono::Local> = event.time.into();
-                
+
                 let mut session_start_guard = session_start.lock().unwrap();
                 let mut last_activity_guard = last_activity.lock().unwrap();
-                
+
                 if let (Some(start), Some(last)) = (*session_start_guard, *last_activity_guard) {
-                    // Calculate time since last activity
                     let idle_duration = event_time - last;
-                    
-                    // Check if we exceeded the timeout (high-level idle)
                     if idle_duration >= chrono::Duration::minutes(timeout_minutes as i64) {
-                        // User was idle for too long - commit the session
-                        let session = WorkSession {
-                            start,
-                            end: last,
-                        };
-                        callback.lock().unwrap()(session);
-                        
-                        // Start new session
+                        // Session ended — commit it
+                        on_session_end.lock().unwrap()(WorkSession { start, end: last });
+                        // New session starting — notify
                         *session_start_guard = Some(event_time);
+                        on_session_start.lock().unwrap()(event_time);
                     }
                 }
-                
-                // Update last activity time
+
                 *last_activity_guard = Some(event_time);
             }) {
                 eprintln!("Error in rdev event listener: {:?}", error);
             }
         });
-        
+
         Ok(())
     }
     

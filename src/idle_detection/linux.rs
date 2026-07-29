@@ -152,9 +152,11 @@ impl LinuxIdleDetector {
 impl IdleDetector for LinuxIdleDetector {
     fn start_monitoring(
         &mut self,
-        callback: SessionCallback,
+        on_session_end: SessionCallback,
+        on_session_start: super::SessionStartCallback,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let callback = Arc::new(Mutex::new(callback));
+        let on_session_end   = Arc::new(Mutex::new(on_session_end));
+        let on_session_start = Arc::new(Mutex::new(on_session_start));
         let session_machine = self.session_machine.clone();
         let last_activity_time = self.last_activity_time.clone();
 
@@ -162,6 +164,8 @@ impl IdleDetector for LinuxIdleDetector {
         let now = chrono::Local::now();
         *last_activity_time.lock().unwrap() = Some(now);
         session_machine.lock().unwrap().on_activity(now);
+        // Fire session-start for the initial session
+        on_session_start.lock().unwrap()(now);
 
         thread::spawn(move || {
             let mut devices = Vec::new();
@@ -253,32 +257,37 @@ impl IdleDetector for LinuxIdleDetector {
                 }
 
                 // Process activity and check timeout in a single lock acquisition
-                let completed_session = {
+                let (completed_session, session_just_started) = {
                     let mut sm = session_machine.lock().unwrap();
-                    
+                    let was_idle = sm.get_current_session().is_none();
+
                     // Process activity through the state machine
                     let activity_result = if had_activity {
                         sm.on_activity(now)
                     } else {
                         None
                     };
-                    
+
                     // Check for timeout (no activity)
                     let timeout_result = sm.check_timeout(now);
-                    
-                    // Return whichever completed a session (should be at most one)
-                    activity_result.or(timeout_result)
+
+                    // Detect Idle→Active transition: was idle before, has session now
+                    let is_now_active = sm.get_current_session().is_some();
+                    let session_just_started = was_idle && is_now_active && had_activity;
+
+                    (activity_result.or(timeout_result), session_just_started)
                 };
-                
+
+                // Fire session-start callback when user returns from idle
+                if session_just_started {
+                    eprintln!("evdev: new session started (user returned from idle)");
+                    on_session_start.lock().unwrap()(now);
+                }
+
                 // Handle completed session outside the lock
                 if let Some(session) = completed_session {
-                    if had_activity {
-                        // This shouldn't happen with the fixed logic
-                        eprintln!("evdev: session completed on activity (unexpected)");
-                    } else {
-                        eprintln!("evdev: session completed due to timeout");
-                    }
-                    callback.lock().unwrap()(session);
+                    eprintln!("evdev: session completed due to timeout");
+                    on_session_end.lock().unwrap()(session);
                 }
 
                 // Poll every 5 seconds - sufficient for multi-second accuracy

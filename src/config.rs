@@ -9,7 +9,12 @@ pub struct Config {
     pub weekly_hours: i64,
     pub cutoff_day_overtime_hours: f64,
     pub cutoff_datetime: chrono::DateTime<chrono::offset::Local>,
+    /// Show a popup asking whether an idle gap was actually work time.
+    #[serde(default = "default_ask_on_idle")]
+    pub ask_on_idle: bool,
 }
+
+fn default_ask_on_idle() -> bool { true }
 
 impl ::std::default::Default for Config {
     fn default() -> Self {
@@ -21,6 +26,7 @@ impl ::std::default::Default for Config {
             weekly_hours: 30,
             cutoff_day_overtime_hours: 0.0,
             cutoff_datetime: "2023-05-01T00:00:00.00+02:00".parse().unwrap(),
+            ask_on_idle: true,
         }
     }
 }

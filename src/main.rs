@@ -3,6 +3,7 @@ mod models;
 mod config;
 mod database;
 mod idle_detection;
+mod idle_popup;
 mod monitoring;
 mod cli;
 

@@ -31,13 +31,21 @@ pub struct WorkSession {
 /// Callback type for work session completion
 pub type SessionCallback = Box<dyn Fn(WorkSession) + Send + 'static>;
 
+/// Callback type fired when a new session starts (user returns from idle).
+/// Argument is the session start time.
+pub type SessionStartCallback = Box<dyn Fn(chrono::DateTime<chrono::Local>) + Send + 'static>;
+
 /// Trait for platform-specific idle detection
 pub trait IdleDetector: Send {
     /// Start monitoring for activity
     ///
-    /// Calls the callback with completed work sessions when the user
-    /// transitions from high-level active to high-level idle.
-    fn start_monitoring(&mut self, callback: SessionCallback) -> Result<(), Box<dyn std::error::Error>>;
+    /// `on_session_end` is called with the completed session when the user goes idle.
+    /// `on_session_start` is called with the start timestamp when the user returns from idle.
+    fn start_monitoring(
+        &mut self,
+        on_session_end: SessionCallback,
+        on_session_start: SessionStartCallback,
+    ) -> Result<(), Box<dyn std::error::Error>>;
     
     /// Stop monitoring (cleanup)
     fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>>;
