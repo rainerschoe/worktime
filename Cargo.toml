@@ -7,6 +7,10 @@ edition = "2021"
 name = "test_idle_evdev"
 path = "test_idle_evdev.rs"
 
+[[bin]]
+name = "test_popup"
+path = "src/bin/test_popup.rs"
+
 [package.metadata]
 license = "MIT OR Apache-2.0"
 

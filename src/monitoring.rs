@@ -122,17 +122,32 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
                 eprintln!("[popup-debug] main loop: received gap {} → {}, showing popup", gap.gap_start.format("%H:%M:%S"), gap.gap_end.format("%H:%M:%S"));
                 let answer = ask_idle_gap(gap.clone());
                 eprintln!("[popup-debug] main loop: popup answered {:?}", answer);
-                if answer == IdleGapAnswer::WorkTime {
-                    database.lock().unwrap().insert_sorted(WorktimeEntry {
-                        start: gap.gap_start,
-                        end: gap.gap_end,
-                        comments: "meeting".into(),
-                    });
-                    println!(
-                        "Idle gap {} → {} added as work time.",
-                        gap.gap_start.format("%H:%M:%S"),
-                        gap.gap_end.format("%H:%M:%S"),
-                    );
+                match answer {
+                    IdleGapAnswer::WorkTime => {
+                        database.lock().unwrap().insert_sorted(WorktimeEntry {
+                            start: gap.gap_start,
+                            end: gap.gap_end,
+                            comments: "meeting".into(),
+                        });
+                        println!(
+                            "Idle gap {} → {} added as work time.",
+                            gap.gap_start.format("%H:%M:%S"),
+                            gap.gap_end.format("%H:%M:%S"),
+                        );
+                    }
+                    IdleGapAnswer::Adjusted { work_start, work_end } => {
+                        database.lock().unwrap().insert_sorted(WorktimeEntry {
+                            start: work_start,
+                            end: work_end,
+                            comments: "meeting".into(),
+                        });
+                        println!(
+                            "Idle gap adjusted: {} → {} added as work time.",
+                            work_start.format("%H:%M:%S"),
+                            work_end.format("%H:%M:%S"),
+                        );
+                    }
+                    IdleGapAnswer::Idle => {}
                 }
             }
         }
