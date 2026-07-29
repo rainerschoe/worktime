@@ -65,11 +65,19 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
 
     // auto-save:
     let database_autosave = database.clone();
+    let idle_detector_autosave = idle_detector_ref.clone();
+    let activity_recorder_autosave = activity_recorder.clone();
     let auto_save_interval_seconds = cfg.auto_save_interval_seconds.clone();
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(auto_save_interval_seconds));
-        println!("Auto-Save");
         let _lock = file_mutex_auto_save.lock();
+        // Commit the current in-progress session (end = now) so a crash loses
+        // at most auto_save_interval_seconds of work.  commit_worktime() will
+        // overwrite this entry on the next save because the start time is the same.
+        if let Some(session) = idle_detector_autosave.lock().unwrap().get_current_session() {
+            activity_recorder_autosave.lock().unwrap().commit_session(session);
+        }
+        println!("Auto-Save");
         database_autosave.lock().unwrap().store_file().unwrap();
     });
 
