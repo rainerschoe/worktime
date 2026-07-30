@@ -54,144 +54,114 @@ impl IdlePopupApp {
     }
 }
 
-// ── Two-handle range slider ──────────────────────────────────────────────────
+// ── Paint-to-select range widget ─────────────────────────────────────────────
 
-/// State stored in egui memory across frames during a drag.
-#[derive(Clone, Copy, Default)]
-struct DragState {
-    /// Which handle is being dragged.
-    handle: DragHandle,
-    /// Accumulated raw pixel offset since drag started (not yet snapped).
-    px_accum: f32,
-}
-
-/// Which handle is currently being dragged.
-#[derive(Clone, Copy, PartialEq, Default)]
-enum DragHandle { #[default] Left, Right }
-
-/// Draw a horizontal timeline strip for `gap`.  The two handles define the
-/// selected work window `[*work_start, *work_end]`.
+/// Draw a horizontal timeline strip for `gap`.
 ///
-/// Drag snaps to 5-minute boundaries when the gap is > 10 minutes.
-/// Returns `true` if either handle moved.
+/// The user click-drags anywhere on (or slightly outside) the track to paint
+/// the work window.  The painted range snaps to 5-minute boundaries when the
+/// gap is > 10 minutes.  Returns `true` if the selection changed.
+///
+/// Extra horizontal padding lets the user start/finish a drag slightly outside
+/// the track to reach exact gap_start / gap_end.
 fn draw_range_slider(
     ui:         &mut egui::Ui,
     gap:        &IdleGapInfo,
     work_start: &mut DateTime<Local>,
     work_end:   &mut DateTime<Local>,
 ) -> bool {
-    let snap       = gap.duration().num_minutes() > 10;
     let total_secs = gap.duration().num_seconds().max(1) as f32;
-    let handle_r   = 8.0_f32;
-    let pad        = handle_r + 4.0;
 
-    // ── Single allocation owns all pointer events ─────────────────────────────
-    let desired_size = egui::vec2(ui.available_width(), 48.0);
+    // Extra pixels beyond the track ends where dragging is still accepted,
+    // making it easy to paint all the way to gap_start / gap_end.
+    let overhang = 18.0_f32;
+    let track_h  = 16.0_f32; // taller bar — easier to hit, no handles needed
+    let label_h  = 16.0_f32; // height reserved below track for grid labels
+
+    let desired_size = egui::vec2(ui.available_width(), track_h + label_h + 6.0);
     let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
 
-    let track_left  = rect.left()  + pad;
-    let track_right = rect.right() - pad;
+    // The visual track sits inset by overhang; the interaction area is the full rect.
+    let track_left  = rect.left()  + overhang;
+    let track_right = rect.right() - overhang;
     let track_width = (track_right - track_left).max(1.0);
-    let track_y     = rect.top() + handle_r + 2.0;
-    let track_h     = 8.0_f32;
+    let track_y_top = rect.top()   + 2.0;
+    let track_y_bot = track_y_top  + track_h;
 
-    // ── Coordinate helpers ────────────────────────────────────────────────────
-    // Convert a DateTime to its pixel x on the track.
+    // ── Snap intervals ────────────────────────────────────────────────────────
+    // Same candidate list as the grid.  The grid picks the coarsest interval
+    // that yields ≤8 lines; snapping uses one level finer (previous entry).
+    let candidates: &[i64] = &[60, 300, 600, 900, 1800, 3600, 7200, 10800];
+    let gap_secs = gap.duration().num_seconds().max(1);
+    let grid_idx = candidates.iter().position(|&iv| gap_secs / iv <= 8)
+        .unwrap_or(candidates.len() - 1);
+    let grid_interval = candidates[grid_idx];
+    // One finer level: index - 1, minimum 60 s (1 minute).
+    let snap_interval = if grid_idx > 0 { candidates[grid_idx - 1] } else { candidates[0] };
+
+    // How many pixels wide one snap unit is — used to detect "near edge".
+    let _snap_px = (snap_interval as f32 / total_secs) * track_width;
+    // Snap a raw pixel x to the nearest snap boundary, with edge-snapping.
+    let x_to_time = |x: f32| -> DateTime<Local> {
+        let frac = ((x - track_left) / track_width).clamp(0.0, 1.0);
+        let secs = (frac * total_secs) as i64;
+
+        // If within half a snap-unit of gap_start or gap_end, snap to the edge.
+        let half = snap_interval / 2;
+        if secs <= half {
+            return gap.gap_start;
+        }
+        if secs >= gap_secs - half {
+            return gap.gap_end;
+        }
+
+        // Otherwise round to nearest snap_interval boundary (absolute clock time).
+        let abs_secs = gap.gap_start.timestamp() + secs;
+        let snapped_abs = ((abs_secs + half) / snap_interval) * snap_interval;
+        let snapped_rel = (snapped_abs - gap.gap_start.timestamp())
+            .clamp(0, gap_secs);
+        gap.gap_start + Duration::seconds(snapped_rel)
+    };
+    // DateTime → x pixel on track.
     let time_to_x = |t: DateTime<Local>| -> f32 {
         let offset = (t - gap.gap_start).num_seconds().max(0) as f32;
         track_left + (offset / total_secs) * track_width
     };
-    // Convert a raw (unsnapped) pixel x to a DateTime, applying snap if needed.
-    let x_to_time = |x: f32| -> DateTime<Local> {
-        let frac = ((x - track_left) / track_width).clamp(0.0, 1.0);
-        let secs = (frac * total_secs) as i64;
-        let snapped = if snap {
-            const SNAP: i64 = 300; // 5 min
-            ((secs + SNAP / 2) / SNAP) * SNAP
-        } else {
-            secs
-        };
-        gap.gap_start + Duration::seconds(snapped)
-    };
 
-    // ── Drag state in egui memory ─────────────────────────────────────────────
-    // We accumulate raw pixel deltas so that snapping doesn't eat tiny movements.
-    // The visual handle position is (time_to_x(current_time) + px_accum); only
-    // when that crosses a snap boundary does the stored DateTime update.
-    let mem_id = resp.id.with("drag_state");
+    // ── Drag: record press_x in memory, update selection live ─────────────────
+    let mem_id = resp.id.with("paint_anchor");
 
     if resp.drag_started() {
-        if let Some(press_pos) = resp.interact_pointer_pos() {
-            let x_start = time_to_x(*work_start);
-            let x_end   = time_to_x(*work_end);
-            let handle = if (press_pos.x - x_start).abs() <= (press_pos.x - x_end).abs() {
-                DragHandle::Left
-            } else {
-                DragHandle::Right
-            };
-            ui.ctx().data_mut(|d| d.insert_temp(mem_id, DragState { handle, px_accum: 0.0 }));
+        if let Some(pos) = resp.interact_pointer_pos() {
+            ui.ctx().data_mut(|d| d.insert_temp::<f32>(mem_id, pos.x));
         }
     }
-
-    let drag_state: Option<DragState> = ui.ctx().data(|d| d.get_temp(mem_id));
-
+    let anchor_x: Option<f32> = ui.ctx().data(|d| d.get_temp(mem_id));
     if resp.drag_stopped() {
-        ui.ctx().data_mut(|d| d.remove_temp::<DragState>(mem_id));
+        ui.ctx().data_mut(|d| d.remove_temp::<f32>(mem_id));
     }
 
     if resp.hovered() || resp.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 
-    // ── Apply accumulated drag to the active handle ───────────────────────────
     let mut changed = false;
-    // px_visual_offset: how far the handle circle is drawn from its snapped position.
-    let mut px_visual_left  = 0.0_f32;
-    let mut px_visual_right = 0.0_f32;
-
     if resp.dragged() {
-        if let Some(mut state) = drag_state {
-            state.px_accum += resp.drag_delta().x;
-
-            match state.handle {
-                DragHandle::Left => {
-                    let base_x   = time_to_x(*work_start);
-                    let x_end    = time_to_x(*work_end);
-                    let raw_x    = (base_x + state.px_accum).clamp(track_left, x_end - 1.0);
-                    let new_time = x_to_time(raw_x)
-                        .clamp(gap.gap_start, *work_end - Duration::minutes(1));
-                    // Visual offset: distance between snapped position and raw drag position.
-                    px_visual_left = raw_x - time_to_x(new_time);
-                    if new_time != *work_start {
-                        // Snap boundary crossed — commit and reset accum to remainder.
-                        state.px_accum = raw_x - time_to_x(new_time);
-                        *work_start = new_time;
-                        changed = true;
-                    }
-                }
-                DragHandle::Right => {
-                    let x_start  = time_to_x(*work_start);
-                    let base_x   = time_to_x(*work_end);
-                    let raw_x    = (base_x + state.px_accum).clamp(x_start + 1.0, track_right);
-                    let new_time = x_to_time(raw_x)
-                        .clamp(*work_start + Duration::minutes(1), gap.gap_end);
-                    px_visual_right = raw_x - time_to_x(new_time);
-                    if new_time != *work_end {
-                        state.px_accum = raw_x - time_to_x(new_time);
-                        *work_end = new_time;
-                        changed = true;
-                    }
-                }
+        if let (Some(anchor), Some(cur)) = (anchor_x, resp.interact_pointer_pos()) {
+            let lo = anchor.min(cur.x);
+            let hi = anchor.max(cur.x);
+            let new_start = x_to_time(lo);
+            let new_end   = x_to_time(hi);
+            // Ensure at least 1 snap interval of width.
+            let min_dur = Duration::seconds(snap_interval);
+            let new_end = new_end.max(new_start + min_dur).min(gap.gap_end);
+            if new_start != *work_start || new_end != *work_end {
+                *work_start = new_start;
+                *work_end   = new_end;
+                changed = true;
             }
-            // Persist updated accum.
-            ui.ctx().data_mut(|d| d.insert_temp(mem_id, state));
         }
     }
-
-    // Recompute positions after possible update
-    // Visual handle positions: snapped time + accumulated sub-snap pixel offset.
-    let x_start = time_to_x(*work_start) + px_visual_left;
-    let x_end   = time_to_x(*work_end)   + px_visual_right;
 
     // ── Paint ─────────────────────────────────────────────────────────────────
     if ui.is_rect_visible(rect) {
@@ -200,45 +170,35 @@ fn draw_range_slider(
 
         // Background track
         painter.rect_filled(
-            egui::Rect::from_x_y_ranges(
-                track_left..=track_right,
-                (track_y - track_h / 2.0)..=(track_y + track_h / 2.0),
+            egui::Rect::from_min_max(
+                egui::pos2(track_left,  track_y_top),
+                egui::pos2(track_right, track_y_bot),
             ),
             4.0,
-            egui::Color32::from_gray(80),
+            egui::Color32::from_gray(55),
         );
 
         // ── Grid lines ───────────────────────────────────────────────────────
-        // Pick the coarsest interval that gives 3–8 lines across the gap.
-        // Candidate intervals in seconds (1m, 5m, 10m, 15m, 30m, 1h, 2h, 3h).
-        let candidates: &[i64] = &[60, 300, 600, 900, 1800, 3600, 7200, 10800];
-        let gap_secs = gap.duration().num_seconds().max(1);
-        let grid_interval = candidates.iter().copied()
-            .find(|&iv| gap_secs / iv <= 8)   // first interval giving ≤8 lines
-            .unwrap_or(candidates[candidates.len() - 1]);
-
-        // Snap gap_start up to the first grid boundary strictly inside the gap.
-        let gap_start_secs = gap.gap_start.timestamp();
+        // (grid_interval already computed above alongside snap_interval)
+        let gap_start_secs  = gap.gap_start.timestamp();
         let first_tick_secs = ((gap_start_secs / grid_interval) + 1) * grid_interval;
-
-        let font_grid  = egui::FontId::proportional(10.0);
-        let tick_top   = track_y - track_h / 2.0 - 6.0; // a bit above track
-        let tick_bot   = track_y + track_h / 2.0 + 2.0; // a bit below track
-        let label_grid_y = tick_bot + 1.0;
+        let font_grid       = egui::FontId::proportional(10.0);
+        let label_grid_y    = track_y_bot + 3.0;
+        let weak_color      = ui.visuals().weak_text_color();
+        let tick_color      = egui::Color32::from_rgba_unmultiplied(
+            weak_color.r(), weak_color.g(), weak_color.b(), 180);
 
         let mut tick_secs = first_tick_secs;
         while tick_secs < gap_start_secs + gap_secs {
             let frac = (tick_secs - gap_start_secs) as f32 / gap_secs as f32;
             let tx   = track_left + frac * track_width;
 
-            // Thin vertical tick spanning the track height
             painter.line_segment(
-                [egui::pos2(tx, tick_top), egui::pos2(tx, tick_bot)],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                [egui::pos2(tx, track_y_top), egui::pos2(tx, track_y_bot)],
+                egui::Stroke::new(1.0, tick_color),
             );
 
-            // Time label — show HH:MM, or just :MM when hours don't change
-            let dt = chrono::Local.timestamp_opt(tick_secs, 0).unwrap();
+            let dt    = chrono::Local.timestamp_opt(tick_secs, 0).unwrap();
             let label = if grid_interval < 3600 {
                 dt.format(":%M").to_string()
             } else {
@@ -249,55 +209,62 @@ fn draw_range_slider(
                 egui::Align2::CENTER_TOP,
                 label,
                 font_grid.clone(),
-                egui::Color32::from_gray(150),
+                weak_color,
             );
 
             tick_secs += grid_interval;
         }
 
-        // Highlight band (drawn on top of grid so it's always visible)
+        // Work window highlight (on top of grid)
+        let sel_left  = time_to_x(*work_start);
+        let sel_right = time_to_x(*work_end);
         painter.rect_filled(
-            egui::Rect::from_x_y_ranges(
-                x_start..=x_end,
-                (track_y - track_h / 2.0)..=(track_y + track_h / 2.0),
+            egui::Rect::from_min_max(
+                egui::pos2(sel_left,  track_y_top),
+                egui::pos2(sel_right, track_y_bot),
             ),
-            4.0,
+            3.0,
             accent,
         );
 
-        // Left handle — highlight when dragging or hovering near it
-        let is_dragging_left = drag_state.map_or(false, |s| s.handle == DragHandle::Left && resp.dragged());
-        let l_hovered = resp.hovered() && {
-            let hit = egui::Rect::from_center_size(
-                egui::pos2(x_start, track_y), egui::vec2(handle_r * 3.0, handle_r * 3.0));
-            resp.hover_pos().map_or(false, |p| hit.contains(p))
-        };
-        painter.circle_filled(egui::pos2(x_start, track_y), handle_r,
-            if is_dragging_left || l_hovered { egui::Color32::from_rgb(200, 220, 255) }
-            else { egui::Color32::WHITE });
-        painter.circle_stroke(egui::pos2(x_start, track_y), handle_r,
-            egui::Stroke::new(2.0, accent));
+        // Live drag ghost: show the raw painted region before snap settles
+        if resp.dragged() {
+            if let (Some(anchor), Some(cur)) = (anchor_x, resp.interact_pointer_pos()) {
+                let lo = anchor.min(cur.x).max(track_left);
+                let hi = anchor.max(cur.x).min(track_right);
+                if hi > lo {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(lo, track_y_top),
+                            egui::pos2(hi, track_y_bot),
+                        ),
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(120, 180, 255, 80),
+                    );
+                }
+            }
+        }
 
-        // Right handle
-        let is_dragging_right = drag_state.map_or(false, |s| s.handle == DragHandle::Right && resp.dragged());
-        let r_hovered = resp.hovered() && {
-            let hit = egui::Rect::from_center_size(
-                egui::pos2(x_end, track_y), egui::vec2(handle_r * 3.0, handle_r * 3.0));
-            resp.hover_pos().map_or(false, |p| hit.contains(p))
-        };
-        painter.circle_filled(egui::pos2(x_end, track_y), handle_r,
-            if is_dragging_right || r_hovered { egui::Color32::from_rgb(200, 220, 255) }
-            else { egui::Color32::WHITE });
-        painter.circle_stroke(egui::pos2(x_end, track_y), handle_r,
-            egui::Stroke::new(2.0, accent));
-
-        // End-point time labels (HH:MM at track edges)
-        let font    = egui::FontId::proportional(11.0);
-        let label_y = track_y + handle_r + 4.0;
-        painter.text(egui::pos2(track_left,  label_y), egui::Align2::LEFT_TOP,
-            gap.gap_start.format("%H:%M").to_string(), font.clone(), egui::Color32::GRAY);
-        painter.text(egui::pos2(track_right, label_y), egui::Align2::RIGHT_TOP,
-            gap.gap_end.format("%H:%M").to_string(),   font.clone(), egui::Color32::GRAY);
+        // End-point time labels — anchored to the widget rect edges with a
+        // small inset so they are never clipped by the window border.
+        let font_edge   = egui::FontId::proportional(11.0);
+        let edge_color  = ui.visuals().text_color();
+        let left_inset  = rect.left() + 4.0;
+        let right_inset = rect.right() - 4.0;
+        painter.text(
+            egui::pos2(left_inset,  label_grid_y),
+            egui::Align2::LEFT_TOP,
+            gap.gap_start.format("%H:%M").to_string(),
+            font_edge.clone(),
+            edge_color,
+        );
+        painter.text(
+            egui::pos2(right_inset, label_grid_y),
+            egui::Align2::RIGHT_TOP,
+            gap.gap_end.format("%H:%M").to_string(),
+            font_edge.clone(),
+            edge_color,
+        );
     }
 
     changed
@@ -369,7 +336,7 @@ impl eframe::App for IdlePopupApp {
         ui.add_space(16.0);
 
         // ── Timeline slider ──────────────────────────────────────────────────
-        ui.label("Drag handles to select the work window:");
+        ui.label("Click and drag to paint the work window:");
         ui.add_space(6.0);
 
         let changed = draw_range_slider(
