@@ -5,6 +5,8 @@ mod database;
 mod idle_detection;
 mod idle_popup;
 mod monitoring;
+mod main_window;
+mod day_view;
 mod cli;
 
 use std::sync::*;
@@ -88,12 +90,46 @@ fn main() {
         // No two processes are allowed to monitor worktime at the same time.
         // It would lead to races in writing database file.
         let monitoring_lock = named_lock::NamedLock::create("worktime_monitoring").unwrap();
-        {
-            if let Ok(_guard) = monitoring_lock.try_lock() {
-                run_interactive_monitoring(database, &cfg);
-            } else {
-                println!("Another process is already monitoring worktime. exiting...")
-            }
-        };
+        let _guard = monitoring_lock.try_lock();
+        if _guard.is_ok() {
+            // One-shot channel: the monitoring thread sends the idle-gap receiver
+            // back to us before it enters its blocking loop.
+            let (rx_out_tx, rx_out_rx) = std::sync::mpsc::sync_channel::<
+                Option<std::sync::mpsc::Receiver<crate::idle_popup::IdleGapInfo>>,
+            >(1);
+
+            // Spawn monitoring loop on a background thread.
+            let database_bg = database.clone();
+            let cfg_clone   = cfg.clone();
+            std::thread::spawn(move || {
+                run_interactive_monitoring(database_bg, &cfg_clone, rx_out_tx);
+            });
+
+            // Wait for the monitoring thread to hand us the idle-gap receiver.
+            let idle_gap_rx = rx_out_rx.recv().ok().flatten();
+
+            // Run the egui main app on the main thread (required by eframe).
+            // The root viewport IS the main window; close hides it (minimize to tray).
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_title("worktime")
+                    .with_inner_size([700.0, 600.0])
+                    .with_min_inner_size([400.0, 300.0]),
+                ..Default::default()
+            };
+            let database_ui         = database.clone();
+            let daily_target_hours  = (cfg.weekly_hours as f64 / 5.0).round() as u32;
+            let _ = eframe::run_native(
+                "worktime",
+                options,
+                Box::new(move |cc| {
+                    Ok(Box::new(main_window::MainApp::new(
+                        database_ui, idle_gap_rx, daily_target_hours, cc,
+                    )))
+                }),
+            );
+        } else {
+            println!("Another process is already monitoring worktime. exiting...")
+        }
     }
 }

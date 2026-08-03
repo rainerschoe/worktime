@@ -4,36 +4,43 @@ use signal_hook::{consts::SIGINT, iterator::Signals};
 use crate::config::Config;
 use crate::database::Database;
 use crate::idle_detection::{ActivityRecorder, create_idle_detector};
-use crate::idle_popup::{ask_idle_gap, IdleGapAnswer};
-use crate::models::WorktimeEntry;
+use crate::idle_popup::IdleGapInfo;
 use crate::utils::format_chrono_duration;
 
-pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) {
+/// Set up idle detection, auto-save, and SIGINT handler, then hand the
+/// idle-gap `Receiver` back to the caller via `rx_out` before entering the
+/// blocking terminal-status loop.
+///
+/// Call this on a **background thread**.  The function blocks forever (until
+/// SIGINT / process exit).  The `rx_out` sender fires exactly once, before the
+/// blocking loop starts, so the caller can retrieve the receiver without any
+/// race condition.
+pub fn run_interactive_monitoring(
+    database: Arc<Mutex<Database>>,
+    cfg: &Config,
+    rx_out: std::sync::mpsc::SyncSender<Option<std::sync::mpsc::Receiver<IdleGapInfo>>>,
+) {
     // ── Idle-gap popup channel ───────────────────────────────────────────────
     // When ask_on_idle is enabled, the recorder sends IdleGapInfo over this
-    // channel. A dedicated thread picks it up, shows the egui popup (blocking
-    // that thread), and inserts the gap into the database if the user confirms.
-    let idle_gap_tx = if cfg.ask_on_idle {
-        let (tx, rx) = std::sync::mpsc::channel::<crate::idle_popup::IdleGapInfo>();
-
-        Some((tx, rx))
+    // channel.  The receiver is passed back to the UI thread via rx_out.
+    let (idle_gap_tx_for_recorder, idle_gap_rx): (
+        Option<std::sync::mpsc::Sender<IdleGapInfo>>,
+        Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
+    ) = if cfg.ask_on_idle {
+        let (tx, rx) = std::sync::mpsc::channel::<IdleGapInfo>();
+        (Some(tx), Some(rx))
     } else {
-        None
+        (None, None)
     };
 
     // ── Activity recorder ────────────────────────────────────────────────────
-    let (idle_gap_tx_for_recorder, idle_gap_rx) = match idle_gap_tx {
-        Some((tx, rx)) => (Some(tx), Some(rx)),
-        None => (None, None),
-    };
     let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(
         database.clone(),
         idle_gap_tx_for_recorder,
     )));
 
-    // Mutex used to synchronize auto-save with sigint handling (avoids writing
-    // while we are in the middle of a file flush).
-    let file_mutex_signal   = Arc::new(Mutex::new(()));
+    // Mutex used to synchronise auto-save with SIGINT handling.
+    let file_mutex_signal    = Arc::new(Mutex::new(()));
     let file_mutex_auto_save = file_mutex_signal.clone();
 
     // ── Idle detector ────────────────────────────────────────────────────────
@@ -103,7 +110,11 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
         database_autosave.lock().unwrap().store_file().unwrap();
     });
 
-    // ── Live terminal status loop ─────────────────────────────────────────────
+    // ── Hand the gap receiver back to the UI thread ──────────────────────────
+    // This fires before the blocking loop below, so the UI thread never waits.
+    let _ = rx_out.send(idle_gap_rx);
+
+    // ── Live terminal status loop (blocks forever) ───────────────────────────
     let overtime_end: chrono::DateTime<chrono::offset::Local> =
         std::time::SystemTime::now().into();
     let overtime = database.lock().unwrap().calculate_overtime(
@@ -113,45 +124,6 @@ pub fn run_interactive_monitoring(database: Arc<Mutex<Database>>, cfg: &Config) 
     println!("overtime: {}", format_chrono_duration(&overtime));
 
     loop {
-        // ── Drain any pending idle-gap questions on the main thread ──────────
-        // eframe requires the main thread; we check the channel here before
-        // sleeping so popups appear promptly after a session ends.
-        if let Some(ref rx) = idle_gap_rx {
-            eprintln!("[popup-debug] main loop: checking channel for gaps");
-            while let Ok(gap) = rx.try_recv() {
-                eprintln!("[popup-debug] main loop: received gap {} → {}, showing popup", gap.gap_start.format("%H:%M:%S"), gap.gap_end.format("%H:%M:%S"));
-                let answer = ask_idle_gap(gap.clone());
-                eprintln!("[popup-debug] main loop: popup answered {:?}", answer);
-                match answer {
-                    IdleGapAnswer::WorkTime => {
-                        database.lock().unwrap().insert_sorted(WorktimeEntry {
-                            start: gap.gap_start,
-                            end: gap.gap_end,
-                            comments: "meeting".into(),
-                        });
-                        println!(
-                            "Idle gap {} → {} added as work time.",
-                            gap.gap_start.format("%H:%M:%S"),
-                            gap.gap_end.format("%H:%M:%S"),
-                        );
-                    }
-                    IdleGapAnswer::Adjusted { work_start, work_end } => {
-                        database.lock().unwrap().insert_sorted(WorktimeEntry {
-                            start: work_start,
-                            end: work_end,
-                            comments: "meeting".into(),
-                        });
-                        println!(
-                            "Idle gap adjusted: {} → {} added as work time.",
-                            work_start.format("%H:%M:%S"),
-                            work_end.format("%H:%M:%S"),
-                        );
-                    }
-                    IdleGapAnswer::Idle => {}
-                }
-            }
-        }
-
         thread::sleep(std::time::Duration::from_secs(2));
         println!("---");
 
