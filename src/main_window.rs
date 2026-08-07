@@ -6,7 +6,10 @@
 //! - Closing the window hides it to tray (sets `window_visible = false` and
 //!   calls `ViewportCommand::Minimized(true)`); the window is not destroyed.
 //! - Clicking the tray icon un-hides the window.
-//! - The tray icon lives on a dedicated GTK thread (Linux requirement).
+//! - GTK is initialised on the MAIN thread (required by libappindicator).
+//!   The GTK event loop is pumped inside every egui frame so tray events and
+//!   popup input events are processed at full frame-rate, not at the old 100 ms
+//!   background-thread polling interval.
 
 use std::sync::{Arc, Mutex};
 use chrono::{Local, NaiveDate};
@@ -15,65 +18,7 @@ use eframe::egui;
 use crate::database::Database;
 use crate::idle_popup::IdleGapInfo;
 
-// ── Tray icon setup ───────────────────────────────────────────────────────────
-
-/// A badge update message sent from the egui thread to the GTK/tray thread.
-pub struct BadgeUpdate {
-    pub rgba:    Vec<u8>,   // 32×32 RGBA pixels
-    pub tooltip: String,
-}
-
-/// Spawn a dedicated GTK thread for the tray icon.  Returns a `Sender` the
-/// egui thread can use to push badge updates.
-fn spawn_tray_thread() -> std::sync::mpsc::Sender<BadgeUpdate> {
-    let (badge_tx, badge_rx) = std::sync::mpsc::channel::<BadgeUpdate>();
-
-    std::thread::spawn(move || {
-        gtk::init().expect("Failed to initialise GTK for tray icon");
-
-        let icon = make_tray_icon_rgba(32, 32, 80, 80, 80);
-
-        let open_item = tray_icon::menu::MenuItem::new("Open worktime", true, None);
-        let quit_item = tray_icon::menu::MenuItem::new("Quit",          true, None);
-        let tray_menu = tray_icon::menu::Menu::new();
-        tray_menu.append(&open_item).unwrap();
-        tray_menu.append(&quit_item).unwrap();
-
-        let _ = QUIT_ITEM_ID.set(quit_item.id().clone());
-        let _ = OPEN_ITEM_ID.set(open_item.id().clone());
-
-        let mut tray = tray_icon::TrayIconBuilder::new()
-            .with_icon(icon)
-            .with_tooltip("worktime")
-            .with_menu(Box::new(tray_menu))
-            .build()
-            .expect("Failed to build tray icon");
-
-        // Drive the GTK event loop ourselves so we can also drain the badge channel.
-        loop {
-            while unsafe { gtk_sys::gtk_events_pending() } != 0 {
-                unsafe { gtk_sys::gtk_main_iteration_do(0) };
-            }
-            while let Ok(update) = badge_rx.try_recv() {
-                if let Ok(new_icon) = tray_icon::Icon::from_rgba(update.rgba, 32, 32) {
-                    let _ = tray.set_icon(Some(new_icon));
-                }
-                let _ = tray.set_tooltip(Some(update.tooltip));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-
-    badge_tx
-}
-
-fn make_tray_icon_rgba(w: u32, h: u32, r: u8, g: u8, b: u8) -> tray_icon::Icon {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[r, g, b, 255]);
-    }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon")
-}
+// ── Static menu-item IDs ──────────────────────────────────────────────────────
 
 static QUIT_ITEM_ID: once_cell::sync::OnceCell<tray_icon::menu::MenuId> =
     once_cell::sync::OnceCell::new();
@@ -86,14 +31,15 @@ pub struct MainApp {
     pub database:    Arc<Mutex<Database>>,
     pub idle_gap_rx: Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
 
-    popup_answer_rx: std::sync::mpsc::Receiver<(IdleGapInfo, crate::idle_popup::IdleGapAnswer)>,
-    popup_answer_tx: std::sync::mpsc::Sender<(IdleGapInfo, crate::idle_popup::IdleGapAnswer)>,
+    /// Queue of popup states waiting to be shown. We show one at a time.
+    pending_popups: std::collections::VecDeque<crate::idle_popup::IdlePopupState>,
 
     /// Whether the window should be visible. When false we keep it minimized.
     window_visible:  bool,
     pub selected_date: NaiveDate,
 
-    badge_tx:           std::sync::mpsc::Sender<BadgeUpdate>,
+    /// The tray icon, kept alive for the duration of the app.
+    tray:               Option<tray_icon::TrayIcon>,
     last_badge_label:   Option<String>,
     daily_target_hours: u32,
 }
@@ -105,16 +51,33 @@ impl MainApp {
         daily_target_hours: u32,
         _cc: &eframe::CreationContext<'_>,
     ) -> Self {
-        let badge_tx = spawn_tray_thread();
-        let (popup_tx, popup_rx) = std::sync::mpsc::channel();
+        // GTK must already have been initialised on the main thread by the
+        // caller (main.rs) before eframe::run_native was invoked.
+
+        let open_item = tray_icon::menu::MenuItem::new("Open worktime", true, None);
+        let quit_item = tray_icon::menu::MenuItem::new("Quit",          true, None);
+        let tray_menu = tray_icon::menu::Menu::new();
+        tray_menu.append(&open_item).unwrap();
+        tray_menu.append(&quit_item).unwrap();
+
+        let _ = QUIT_ITEM_ID.set(quit_item.id().clone());
+        let _ = OPEN_ITEM_ID.set(open_item.id().clone());
+
+        let icon = make_tray_icon_rgba(32, 32, 80, 80, 80);
+        let tray = tray_icon::TrayIconBuilder::new()
+            .with_icon(icon)
+            .with_tooltip("worktime")
+            .with_menu(Box::new(tray_menu))
+            .build()
+            .ok(); // soft-fail: tray unavailable in some environments
+
         Self {
             database,
             idle_gap_rx,
-            popup_answer_rx: popup_rx,
-            popup_answer_tx: popup_tx,
+            pending_popups: std::collections::VecDeque::new(),
             window_visible: true,
             selected_date: Local::now().date_naive(),
-            badge_tx,
+            tray,
             last_badge_label: None,
             daily_target_hours,
         }
@@ -125,6 +88,16 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+
+        // ── Pump the GTK event loop ───────────────────────────────────────────
+        // This must happen on the main thread (where GTK was initialised).
+        // Draining all pending GTK events every egui frame ensures tray-menu
+        // clicks and popup window input are processed at full frame-rate.
+        unsafe {
+            while gtk_sys::gtk_events_pending() != 0 {
+                gtk_sys::gtk_main_iteration_do(0);
+            }
+        }
 
         // ── Handle window close → hide to tray instead of quitting ────────────
         if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -158,40 +131,76 @@ impl eframe::App for MainApp {
             }
         }
 
-        // ── Poll idle-gap channel ─────────────────────────────────────────────
+        // ── Poll idle-gap channel → queue popups ──────────────────────────────
         if let Some(ref rx) = self.idle_gap_rx {
             while let Ok(gap) = rx.try_recv() {
-                let tx = self.popup_answer_tx.clone();
-                std::thread::spawn(move || {
-                    let answer = crate::idle_popup::ask_idle_gap(gap.clone());
-                    let _ = tx.send((gap, answer));
-                });
+                self.pending_popups.push_back(
+                    crate::idle_popup::IdlePopupState::new(gap)
+                );
             }
         }
 
-        // ── Apply popup answers ───────────────────────────────────────────────
-        while let Ok((gap, answer)) = self.popup_answer_rx.try_recv() {
-            use crate::idle_popup::IdleGapAnswer;
-            use crate::models::WorktimeEntry;
-            let mut db = self.database.lock().unwrap();
-            match answer {
-                IdleGapAnswer::WorkTime => {
-                    db.insert_sorted(WorktimeEntry {
-                        start: gap.gap_start, end: gap.gap_end,
-                        comments: String::new(),
+        // ── Show the front popup as an immediate sub-viewport ─────────────────
+        if let Some(popup) = self.pending_popups.front_mut() {
+            let gap        = popup.gap.clone();
+            let dur        = gap.duration();
+            let title      = format!(
+                "Idle {}  ({} → {})",
+                crate::utils::format_chrono_duration(&dur),
+                gap.gap_start.format("%H:%M"),
+                gap.gap_end.format("%H:%M"),
+            );
+
+            let mut answered = false;
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("idle_popup"),
+                egui::ViewportBuilder::default()
+                    .with_title(&title)
+                    .with_inner_size([520.0, 340.0])
+                    .with_resizable(false)
+                    .with_always_on_top(),
+                |ctx, _class| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::idle_popup::draw_idle_popup(ui, popup);
                     });
-                    println!("Idle gap {} → {} added as work time.",
-                        gap.gap_start.format("%H:%M:%S"), gap.gap_end.format("%H:%M:%S"));
+
+                    // Close viewport once answered (next frame).
+                    if popup.answer.is_some() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        answered = true;
+                    }
+                },
+            );
+
+            if answered {
+                // Apply the answer to the database.
+                if let Some(popup_done) = self.pending_popups.pop_front() {
+                    use crate::idle_popup::IdleGapAnswer;
+                    use crate::models::WorktimeEntry;
+                    let mut db = self.database.lock().unwrap();
+                    match popup_done.answer.unwrap() {
+                        IdleGapAnswer::WorkTime => {
+                            db.insert_sorted(WorktimeEntry {
+                                start: popup_done.gap.gap_start,
+                                end:   popup_done.gap.gap_end,
+                                comments: String::new(),
+                            });
+                            println!("Idle gap {} → {} added as work time.",
+                                popup_done.gap.gap_start.format("%H:%M:%S"),
+                                popup_done.gap.gap_end.format("%H:%M:%S"));
+                        }
+                        IdleGapAnswer::Adjusted { work_start, work_end } => {
+                            db.insert_sorted(WorktimeEntry {
+                                start: work_start, end: work_end,
+                                comments: String::new(),
+                            });
+                            println!("Idle gap adjusted: {} → {} added as work time.",
+                                work_start.format("%H:%M:%S"), work_end.format("%H:%M:%S"));
+                        }
+                        IdleGapAnswer::Idle => {}
+                    }
+                    db.normalize(60);
                 }
-                IdleGapAnswer::Adjusted { work_start, work_end } => {
-                    db.insert_sorted(WorktimeEntry {
-                        start: work_start, end: work_end,
-                        comments: String::new(),
-                    });
-                    println!("Idle gap adjusted: {} → {} added as work time.",
-                        work_start.format("%H:%M:%S"), work_end.format("%H:%M:%S"));
-                }
-                IdleGapAnswer::Idle => {}
             }
         }
 
@@ -203,8 +212,8 @@ impl eframe::App for MainApp {
             crate::day_view::draw_day_view(ui, &mut self.selected_date, &self.database);
         });
 
-        // Wake up twice per second to notice tray/channel events even when idle.
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        // Keep the UI ticking for tray/channel events and popup interactions.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
@@ -242,14 +251,27 @@ impl MainApp {
             (40, 160, 80)
         };
 
-        let rgba    = render_badge_rgba(32, 32, &label, r, g, b);
-        let tooltip = format!("worktime — {} today", format_mins(today_mins));
-        let _ = self.badge_tx.send(BadgeUpdate { rgba, tooltip });
+        if let Some(ref mut tray) = self.tray {
+            let rgba    = render_badge_rgba(32, 32, &label, r, g, b);
+            let tooltip = format!("worktime — {} today", format_mins(today_mins));
+            if let Ok(new_icon) = tray_icon::Icon::from_rgba(rgba, 32, 32) {
+                let _ = tray.set_icon(Some(new_icon));
+            }
+            let _ = tray.set_tooltip(Some(tooltip));
+        }
 
         if self.selected_date != today {
             self.selected_date = today;
         }
     }
+}
+
+fn make_tray_icon_rgba(w: u32, h: u32, r: u8, g: u8, b: u8) -> tray_icon::Icon {
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..(w * h) {
+        rgba.extend_from_slice(&[r, g, b, 255]);
+    }
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon")
 }
 
 // ── Badge helpers ─────────────────────────────────────────────────────────────

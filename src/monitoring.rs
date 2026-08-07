@@ -127,13 +127,21 @@ pub fn run_interactive_monitoring(
         thread::sleep(std::time::Duration::from_secs(2));
         println!("---");
 
-        let detector = idle_detector_ref.lock().unwrap();
-        let current_session = detector.get_current_session();
-        let current_start   = current_session.map(|s| s.start);
-        let idle_duration   = detector.get_idle_duration();
-        drop(detector);
+        // Hold each lock only long enough to copy the values out.
+        // Holding database.lock() across the print calls would block the UI
+        // thread (which also locks the database every frame) for up to 2 s.
+        let (current_start, idle_duration) = {
+            let detector = idle_detector_ref.lock().unwrap();
+            let current_start = detector.get_current_session().map(|s| s.start);
+            let idle_duration = detector.get_idle_duration();
+            (current_start, idle_duration)
+        };
 
-        database.lock().unwrap().print_vertical_timeline_with_current(current_start);
+        let (rows, now) = {
+            let db = database.lock().unwrap();
+            (db.rows.clone(), chrono::Local::now())
+        };
+        Database::print_timeline_from_rows(&rows, now, current_start);
 
         if let Some(idle_dur) = idle_duration {
             let idle_secs = idle_dur.num_seconds();

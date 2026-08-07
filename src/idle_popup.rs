@@ -1,7 +1,9 @@
 //! Graphical popup asking the user whether an idle gap was actually work time.
 //!
-//! Uses eframe/egui 0.35 which exposes `fn ui()` on the `App` trait and requires
-//! the `glow` feature for `run_native`.
+//! The popup is now rendered as an immediate sub-viewport from the main egui
+//! app, so it always runs on the main thread. The old `run_native`-based
+//! `ask_idle_gap` is kept for the `test_popup` binary but is no longer used
+//! by the main app.
 
 use chrono::{DateTime, Local, Duration, TimeZone};
 use eframe::egui;
@@ -34,15 +36,106 @@ impl IdleGapInfo {
     }
 }
 
-// ── Internal egui app ────────────────────────────────────────────────────────
+// ── Public viewport-based popup state ────────────────────────────────────────
+
+/// Mutable state for one pending idle-gap popup.
+/// Lives in `MainApp` and rendered each frame via `show_viewport_immediate`.
+#[derive(Clone)]
+pub struct IdlePopupState {
+    pub gap:        IdleGapInfo,
+    pub work_start: DateTime<Local>,
+    pub work_end:   DateTime<Local>,
+    /// Set when the user clicks a button — the main app drains this.
+    pub answer:     Option<IdleGapAnswer>,
+}
+
+impl IdlePopupState {
+    pub fn new(gap: IdleGapInfo) -> Self {
+        let work_start = gap.gap_start;
+        let work_end   = gap.gap_end;
+        Self { gap, work_start, work_end, answer: None }
+    }
+}
+
+/// Draw the popup UI into `ui`. Returns true when the user has answered
+/// (i.e. `state.answer` has been set). Caller should close the viewport.
+pub fn draw_idle_popup(ui: &mut egui::Ui, state: &mut IdlePopupState) {
+    ui.add_space(12.0);
+    ui.heading("Were you working?");
+    ui.add_space(8.0);
+
+    let dur = state.gap.duration();
+    ui.label(format!(
+        "No activity was detected for {}.",
+        format_chrono_duration(&dur),
+    ));
+    ui.label(format!(
+        "Gap:  {}  →  {}",
+        state.gap.gap_start.format("%H:%M:%S"),
+        state.gap.gap_end.format("%H:%M:%S"),
+    ));
+
+    ui.add_space(10.0);
+    ui.label("Were you in a meeting or otherwise working away from the keyboard?");
+    ui.add_space(12.0);
+
+    ui.horizontal(|ui| {
+        if ui.add_sized([145.0, 36.0],
+            egui::Button::new(egui::RichText::new("✔  All Work Time").size(14.0))
+        ).clicked() {
+            state.answer = Some(IdleGapAnswer::WorkTime);
+        }
+        ui.add_space(8.0);
+        if ui.add_sized([130.0, 36.0],
+            egui::Button::new(egui::RichText::new("✘  All Idle").size(14.0))
+        ).clicked() {
+            state.answer = Some(IdleGapAnswer::Idle);
+        }
+        ui.add_space(8.0);
+        if ui.add_sized([180.0, 36.0],
+            egui::Button::new(egui::RichText::new("⏱  Save adjusted work time").size(14.0))
+        ).clicked() {
+            state.answer = Some(IdleGapAnswer::Adjusted {
+                work_start: state.work_start,
+                work_end:   state.work_end,
+            });
+        }
+    });
+
+    ui.add_space(16.0);
+    ui.label("Click and drag to paint the work window:");
+    ui.add_space(6.0);
+
+    let changed = draw_range_slider(ui, &state.gap, &mut state.work_start, &mut state.work_end);
+    if changed {
+        ui.ctx().request_repaint();
+    }
+
+    ui.add_space(20.0);
+
+    let work_dur = state.work_end - state.work_start;
+    ui.label(
+        egui::RichText::new(format!(
+            "Work: {}  →  {}   ({})",
+            state.work_start.format("%H:%M"),
+            state.work_end.format("%H:%M"),
+            format_chrono_duration(&work_dur),
+        ))
+        .strong(),
+    );
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.weak("worktime idle-gap tracker");
+}
+
+// ── Internal egui app (kept for test_popup binary) ───────────────────────────
 
 struct IdlePopupApp {
     gap:        IdleGapInfo,
-    /// Current left handle position (inclusive start of work window).
     work_start: DateTime<Local>,
-    /// Current right handle position (exclusive end of work window).
     work_end:   DateTime<Local>,
-    /// Set when the user clicks a button; causes the window to close next frame.
     answer:     Option<IdleGapAnswer>,
 }
 
@@ -79,7 +172,7 @@ fn draw_range_slider(
     let label_h  = 16.0_f32; // height reserved below track for grid labels
 
     let desired_size = egui::vec2(ui.available_width(), track_h + label_h + 6.0);
-    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
+    let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
 
     // The visual track sits inset by overhang; the interaction area is the full rect.
     let track_left  = rect.left()  + overhang;

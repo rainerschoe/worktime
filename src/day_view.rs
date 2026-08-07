@@ -7,6 +7,21 @@ use eframe::egui;
 use crate::database::Database;
 use crate::models::WorktimeEntry;
 
+// ── Duration formatting helper ────────────────────────────────────────────────
+
+/// Format a chrono Duration as "Xh:MMm" (e.g. "1h:23m") for display inside
+/// timeline blocks.  For very short durations shows just minutes.
+fn fmt_duration(d: Duration) -> String {
+    let total_mins = d.num_minutes().abs();
+    let h = total_mins / 60;
+    let m = total_mins % 60;
+    if h == 0 {
+        format!("{}m", m)
+    } else {
+        format!("{}h {:02}m", h, m)
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn draw_day_view(
@@ -39,26 +54,12 @@ pub fn draw_day_view(
 
     ui.add_space(6.0);
 
-    // ── Load entries for selected day ─────────────────────────────────────────
-    let (day_start, day_end) = day_bounds(*selected_date);
-    let entries: Vec<WorktimeEntry> = database.lock().unwrap()
-        .query((day_start, day_end))
-        .collect();
-
-    // Total label
-    let total: Duration = entries.iter()
-        .map(|e| e.duration())
-        .fold(Duration::zero(), |a, d| a + d);
-    let h = total.num_hours();
-    let m = (total.num_minutes() % 60).abs();
-    ui.label(format!("Total: {}h {:02}m", h, m));
-
     ui.add_space(4.0);
     ui.separator();
     ui.add_space(4.0);
 
     // ── Timeline widget ───────────────────────────────────────────────────────
-    draw_day_timeline(ui, *selected_date, &entries, database);
+    draw_day_timeline(ui, *selected_date, database);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,6 +87,24 @@ fn secs_to_dt(date: NaiveDate, secs: f32) -> DateTime<Local> {
 fn snap_secs(secs: f32, snap_interval: i64) -> f32 {
     let iv = snap_interval as f32;
     (secs / iv).round() * iv
+}
+
+/// Snap to the nearest grid boundary, entry edge, or current time when close.
+fn snap_secs_with_targets(secs: f32, snap_interval: i64, targets: &[f32]) -> f32 {
+    let snapped = snap_secs(secs, snap_interval);
+    let threshold = (snap_interval as f32 / 2.0).max(60.0);
+    let mut best = snapped;
+    let mut best_dist = (secs - snapped).abs();
+
+    for &target in targets {
+        let dist = (secs - target).abs();
+        if dist <= threshold && dist < best_dist {
+            best = target;
+            best_dist = dist;
+        }
+    }
+
+    best
 }
 
 // ── Timeline state (stored in egui temp data) ─────────────────────────────────
@@ -123,11 +142,17 @@ const PPH_MAX:      f32  = 400.0;
 // ── draw_day_timeline ─────────────────────────────────────────────────────────
 
 fn draw_day_timeline(
-    ui:        &mut egui::Ui,
-    date:       NaiveDate,
-    entries:   &[WorktimeEntry],
-    database:  &Arc<Mutex<Database>>,
+    ui:       &mut egui::Ui,
+    date:      NaiveDate,
+    database: &Arc<Mutex<Database>>,
 ) {
+    // Always read fresh so the live session end-time is never stale.
+    let (day_start, day_end) = day_bounds(date);
+    let entries: Vec<WorktimeEntry> = database.lock().unwrap()
+        .query((day_start, day_end))
+        .collect();
+    let entries = entries.as_slice();
+
     let state_id = ui.id().with("tl_state");
     let mut state: TimelineState = ui.ctx()
         .data(|d| d.get_temp::<TimelineState>(state_id))
@@ -185,6 +210,25 @@ fn draw_day_timeline(
     // Use 5-min snap when view span > 10 min (always true here).
     let snap_interval: i64 = 300; // 5 minutes
 
+    // ── "Now" — current time in seconds-from-midnight (None on other days) ────
+    let is_today = date == Local::now().date_naive();
+    let now_secs: Option<f32> = if is_today {
+        let now = Local::now();
+        Some(now.num_seconds_from_midnight() as f32)
+    } else {
+        None
+    };
+
+    let mut snap_targets: Vec<f32> = entries.iter()
+        .flat_map(|e| [
+            e.start.num_seconds_from_midnight() as f32,
+            e.end.num_seconds_from_midnight() as f32,
+        ])
+        .collect();
+    if let Some(now) = now_secs {
+        snap_targets.push(now);
+    }
+
     // ── Drag interaction ──────────────────────────────────────────────────────
     let shift = ui.input(|i| i.modifiers.shift);
 
@@ -197,17 +241,26 @@ fn draw_day_timeline(
         })
     };
 
+    // Gate interactions: pointer position must be in the past (or not today).
+    let is_past_or_not_today = |secs: f32| -> bool {
+        match now_secs {
+            None => true,               // not today → all times are "past"
+            Some(now) => secs <= now,   // today → only allow up to now
+        }
+    };
+
     if resp.drag_started() {
         if let Some(pos) = resp.interact_pointer_pos() {
             if pos.x >= entry_left {
-                let secs = snap_secs(y_to_secs(pos.y), snap_interval);
-                let mode = if shift { DragMode::Replace } else { DragMode::Draw };
-                // Start drag regardless of whether we're on an entry.
-                state.drag = Some(DragState {
-                    anchor_secs:  secs,
-                    current_secs: secs,
-                    mode,
-                });
+                let secs = snap_secs_with_targets(y_to_secs(pos.y), snap_interval, &snap_targets);
+                if is_past_or_not_today(secs) {
+                    let mode = if shift { DragMode::Replace } else { DragMode::Draw };
+                    state.drag = Some(DragState {
+                        anchor_secs:  secs,
+                        current_secs: secs,
+                        mode,
+                    });
+                }
             }
         }
     }
@@ -215,7 +268,12 @@ fn draw_day_timeline(
     if resp.dragged() {
         if let Some(ref mut drag) = state.drag {
             if let Some(pos) = resp.interact_pointer_pos() {
-                drag.current_secs = snap_secs(y_to_secs(pos.y), snap_interval);
+                let raw = snap_secs_with_targets(y_to_secs(pos.y), snap_interval, &snap_targets);
+                // Clamp current end to "now" on today.
+                drag.current_secs = match now_secs {
+                    Some(now) => raw.min(now),
+                    None => raw,
+                };
             }
         }
     }
@@ -234,13 +292,18 @@ fn draw_day_timeline(
                 let mut db = database.lock().unwrap();
                 match drag.mode {
                     DragMode::Draw => {
-                        clip_and_insert(&mut db.rows, new_entry);
+                        if !extend_live_entry_for_day(&mut db.rows, &new_entry, date, now_secs) {
+                            // Only clip against entries for this day.
+                            clip_and_insert_for_day(&mut db.rows, new_entry, date);
+                        }
                     }
                     DragMode::Replace => {
-                        remove_overlapping(&mut db.rows, &new_entry);
+                        // Remove overlapping entries for this day only.
+                        remove_overlapping_for_day(&mut db.rows, &new_entry, date);
                         db.insert_sorted(new_entry);
                     }
                 }
+                db.normalize(60);
                 let _ = db.store_file();
                 db_changed = true;
             }
@@ -248,16 +311,30 @@ fn draw_day_timeline(
     }
 
     // Click (no drag) on existing entry → schedule delete confirmation.
+    // Only allow clicking entries that are fully in the past (or not today).
     if resp.clicked() && state.drag.is_none() {
         if let Some(pos) = resp.interact_pointer_pos() {
             if pos.x >= entry_left {
                 let secs = y_to_secs(pos.y);
-                if let Some(idx) = entry_at(secs) {
-                    state.pending_delete = Some(idx);
+                if is_past_or_not_today(secs) {
+                    if let Some(idx) = entry_at(secs) {
+                        state.pending_delete = Some(idx);
+                    }
                 }
             }
         }
     }
+
+    // ── Refresh entries if DB was mutated this frame ──────────────────────────
+    // (The Vec at the top is already fresh for the normal path; we only need
+    //  to re-query when the user just drew/deleted something this very frame.)
+    let entries_updated: Vec<WorktimeEntry>;
+    let entries = if db_changed {
+        entries_updated = database.lock().unwrap().query((day_start, day_end)).collect();
+        entries_updated.as_slice()
+    } else {
+        entries
+    };
 
     // ── Delete confirmation popup ─────────────────────────────────────────────
     if let Some(del_idx) = state.pending_delete {
@@ -268,7 +345,6 @@ fn draw_day_timeline(
                 entry.start.format("%H:%M"),
                 entry.end.format("%H:%M"),
             );
-            // Position the popup near the entry's y midpoint.
             let mid_y = (secs_to_y(entry.start.num_seconds_from_midnight() as f32)
                 + secs_to_y(entry.end.num_seconds_from_midnight() as f32)) / 2.0;
             let popup_pos = egui::pos2(entry_left + 8.0, mid_y - 20.0);
@@ -284,8 +360,13 @@ fn draw_day_timeline(
                     ui.horizontal(|ui| {
                         if ui.button("Delete").clicked() {
                             let start = entry.start;
+                            let end   = entry.end;
                             let mut db = database.lock().unwrap();
-                            db.rows.retain(|r| r.start != start);
+                            // `entry` may be a day-clipped view of a row that spans midnight.
+                            // Match the row that fully contains [start, end] rather than
+                            // requiring an exact timestamp match on both ends.
+                            db.rows.retain(|r| !(r.start <= start && r.end >= end));
+                            db.normalize(60);
                             let _ = db.store_file();
                             state.pending_delete = None;
                             db_changed = true;
@@ -300,27 +381,35 @@ fn draw_day_timeline(
         }
     }
 
-    // Reload entries if we just mutated the DB.
-    let entries_live: Vec<WorktimeEntry>;
-    let entries_ref: &[WorktimeEntry] = if db_changed {
-        let (ds, de) = day_bounds(date);
-        entries_live = database.lock().unwrap().query((ds, de)).collect();
-        &entries_live
-    } else {
-        entries
-    };
+    let entries_ref: &[WorktimeEntry] = entries;
 
     // ── Paint ─────────────────────────────────────────────────────────────────
     if ui.is_rect_visible(rect) {
-        let painter = ui.painter_at(rect);
+        let painter  = ui.painter_at(rect);
         let accent   = egui::Color32::from_rgb(59, 130, 212);
         let bg       = egui::Color32::from_gray(35);
+        let bg_future= egui::Color32::from_gray(28); // slightly darker tint for future
         let grid_h   = egui::Color32::from_gray(60);
         let grid_hh  = egui::Color32::from_gray(48);
         let text_c   = ui.visuals().text_color();
+        let gap_text = egui::Color32::from_gray(130);
+        let font_lbl = egui::FontId::proportional(11.0);
 
-        // Background
+        // Background (split at "now" on today)
         painter.rect_filled(rect, 0.0, bg);
+        if let Some(now) = now_secs {
+            let y_now = secs_to_y(now).clamp(rect.top(), rect.bottom());
+            // Shade the future area slightly darker
+            if y_now < rect.bottom() {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(entry_left, y_now),
+                        egui::pos2(rect.right(), rect.bottom()),
+                    ),
+                    0.0, bg_future,
+                );
+            }
+        }
 
         // Hour / half-hour grid lines + labels
         let mut h = VIEW_START_H as i32;
@@ -336,7 +425,7 @@ fn draw_day_timeline(
                     egui::pos2(rect.left() + 2.0, y + 2.0),
                     egui::Align2::LEFT_TOP,
                     format!("{:02}:00", h),
-                    egui::FontId::proportional(11.0),
+                    font_lbl.clone(),
                     text_c,
                 );
             }
@@ -350,30 +439,165 @@ fn draw_day_timeline(
             h += 1;
         }
 
-        // Existing work entry blocks
+        // ── Gap duration labels (between consecutive work entries) ────────────
+        let hover_pos = resp.hover_pos();
+        let entry_mid_x = (entry_left + entry_right) / 2.0;
+        for window in entries_ref.windows(2) {
+            let gap_start_s = window[0].end.num_seconds_from_midnight() as f32;
+            let gap_end_s   = window[1].start.num_seconds_from_midnight() as f32;
+            let gap_dur     = window[1].start - window[0].end;
+            if gap_dur > Duration::zero() {
+                let yt_gap = secs_to_y(gap_start_s).max(rect.top());
+                let yb_gap = secs_to_y(gap_end_s).min(rect.bottom());
+                let mid_y  = (yt_gap + yb_gap) / 2.0;
+                let height = yb_gap - yt_gap;
+                let label  = fmt_duration(gap_dur);
+
+                // Measure text to see if it fits in the gap height.
+                // Approx: font size ~11px, needs at least 14px to be readable.
+                let fits = height >= 14.0;
+                if fits {
+                    // Centred horizontally in the entry column.
+                    painter.text(
+                        egui::pos2(entry_mid_x, mid_y),
+                        egui::Align2::CENTER_CENTER,
+                        &label,
+                        font_lbl.clone(),
+                        gap_text,
+                    );
+                } else if let Some(hp) = hover_pos {
+                    // Show as tooltip when hovered over this gap band.
+                    if hp.y >= yt_gap && hp.y <= yb_gap && hp.x >= entry_left {
+                        egui::Tooltip::always_open(
+                            ui.ctx().clone(),
+                            ui.layer_id(),
+                            egui::Id::new("gap_tooltip").with(window[0].end),
+                            egui::pos2(hp.x + 12.0, hp.y),
+                        )
+                        .show(|ui| { ui.label(format!("Gap: {}", label)); });
+                    }
+                }
+            }
+        }
+
+        // ── Work entry blocks ─────────────────────────────────────────────────
+        // Helper: paint a small boxed label with a dark background.
+        let paint_badge = |painter: &egui::Painter,
+                           pos: egui::Pos2,
+                           align: egui::Align2,
+                           text: &str,
+                           font: egui::FontId,
+                           text_color: egui::Color32,
+                           bg_color: egui::Color32| {
+            let galley = painter.layout_no_wrap(
+                text.to_string(), font, text_color,
+            );
+            let size   = galley.size();
+            let origin = align.anchor_rect(
+                egui::Rect::from_min_size(pos, size)
+            ).min;
+            let bg_rect = egui::Rect::from_min_size(origin, size)
+                .expand(3.0);
+            painter.rect_filled(bg_rect, 3.0, bg_color);
+            painter.rect_stroke(bg_rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Inside);
+            painter.galley(origin, galley, text_color);
+        };
+
+        let mut hover_badges: Vec<(egui::Pos2, egui::Align2, String)> = Vec::new();
+
         for (idx, entry) in entries_ref.iter().enumerate() {
             let s = entry.start.num_seconds_from_midnight() as f32;
             let e = entry.end.num_seconds_from_midnight()   as f32;
             let yt = secs_to_y(s).max(rect.top());
             let yb = secs_to_y(e).min(rect.bottom());
-            if yb > yt {
-                // Dim if this entry is pending deletion.
-                let col = if state.pending_delete == Some(idx) {
-                    egui::Color32::from_rgb(40, 90, 150)
-                } else {
-                    accent
-                };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(entry_left, yt),
-                        egui::pos2(entry_right, yb),
-                    ),
-                    3.0, col,
+            if yb <= yt { continue; }
+
+            let col = if state.pending_delete == Some(idx) {
+                egui::Color32::from_rgb(40, 90, 150)
+            } else {
+                accent
+            };
+            let block_rect = egui::Rect::from_min_max(
+                egui::pos2(entry_left, yt),
+                egui::pos2(entry_right, yb),
+            );
+            painter.rect_filled(block_rect, 3.0, col);
+
+            // Duration label centred in the block.
+            let dur     = entry.duration();
+            let dur_lbl = fmt_duration(dur);
+            let block_h = yb - yt;
+            let mid_y   = (yt + yb) / 2.0;
+
+            if block_h >= 14.0 {
+                // Enough room — paint duration directly.
+                painter.text(
+                    egui::pos2(entry_mid_x, mid_y),
+                    egui::Align2::CENTER_CENTER,
+                    &dur_lbl,
+                    font_lbl.clone(),
+                    egui::Color32::WHITE,
                 );
+            } else if let Some(hp) = hover_pos {
+                // Too small — show tooltip on hover.
+                if block_rect.contains(hp) {
+                    egui::Tooltip::always_open(
+                        ui.ctx().clone(),
+                        ui.layer_id(),
+                        egui::Id::new("block_tooltip").with(entry.start),
+                        egui::pos2(hp.x + 12.0, hp.y),
+                    )
+                    .show(|ui| {
+                        ui.label(format!(
+                            "{}–{}  ({})",
+                            entry.start.format("%H:%M"),
+                            entry.end.format("%H:%M"),
+                            dur_lbl,
+                        ));
+                    });
+                }
+            }
+
+            // ── Hovered: start badge above, end badge below the block ─────────
+            if let Some(hp) = hover_pos {
+                if block_rect.contains(hp) {
+                    hover_badges.push((
+                        egui::pos2(entry_mid_x, yt - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        entry.start.format("%H:%M").to_string(),
+                    ));
+                    hover_badges.push((
+                        egui::pos2(entry_mid_x, yb + 2.0),
+                        egui::Align2::CENTER_TOP,
+                        entry.end.format("%H:%M").to_string(),
+                    ));
+                }
             }
         }
 
-        // Ghost drag preview
+        // ── Total worked time label at the bottom of the canvas ───────────────
+        {
+            let total: Duration = entries_ref.iter()
+                .map(|e| e.duration())
+                .fold(Duration::zero(), |a, d| a + d);
+            let th = total.num_hours();
+            let tm = (total.num_minutes() % 60).abs();
+            let total_txt = format!("Total: {}h {:02}m", th, tm);
+            let font_tot  = egui::FontId::proportional(13.0);
+            let pos       = egui::pos2(entry_mid_x, rect.bottom() - 6.0);
+            // Boxed badge so it reads even when sitting on top of a work block.
+            paint_badge(
+                &painter,
+                pos,
+                egui::Align2::CENTER_BOTTOM,
+                &total_txt,
+                font_tot,
+                egui::Color32::WHITE,
+                egui::Color32::from_black_alpha(180),
+            );
+        }
+
+        // ── Ghost drag preview ────────────────────────────────────────────────
         if let Some(drag) = state.drag {
             let lo = drag.anchor_secs.min(drag.current_secs);
             let hi = drag.anchor_secs.max(drag.current_secs);
@@ -381,9 +605,9 @@ fn draw_day_timeline(
             let yb = secs_to_y(hi).min(rect.bottom());
             if yb > yt {
                 let ghost_col = if drag.mode == DragMode::Replace {
-                    egui::Color32::from_rgba_unmultiplied(220, 100, 60, 80) // orange-ish for replace
+                    egui::Color32::from_rgba_unmultiplied(220, 100, 60, 80)
                 } else {
-                    egui::Color32::from_rgba_unmultiplied(59, 130, 212, 80) // blue ghost for draw
+                    egui::Color32::from_rgba_unmultiplied(59, 130, 212, 80)
                 };
                 painter.rect_filled(
                     egui::Rect::from_min_max(
@@ -392,27 +616,84 @@ fn draw_day_timeline(
                     ),
                     3.0, ghost_col,
                 );
-                // Time label on ghost
-                let label = format!(
-                    "{}–{}",
-                    fmt_secs(lo),
-                    fmt_secs(hi),
-                );
+                let label = format!("{}–{}", fmt_secs(lo), fmt_secs(hi));
                 painter.text(
                     egui::pos2(entry_left + 4.0, yt + 2.0),
                     egui::Align2::LEFT_TOP,
                     label,
-                    egui::FontId::proportional(11.0),
+                    font_lbl.clone(),
                     egui::Color32::WHITE,
                 );
             }
         }
 
-        // Cursor crosshair while dragging inside the entry area
+        for (pos, align, text) in hover_badges {
+            paint_badge(
+                &painter,
+                pos,
+                align,
+                &text,
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+                egui::Color32::from_black_alpha(180),
+            );
+        }
+
+        // ── Red "now" line ────────────────────────────────────────────────────
+        if let Some(now) = now_secs {
+            let y_now = secs_to_y(now);
+            if y_now >= rect.top() && y_now <= rect.bottom() {
+                painter.circle_filled(
+                    egui::pos2(entry_left, y_now),
+                    4.0,
+                    egui::Color32::RED,
+                );
+                painter.line_segment(
+                    [egui::pos2(entry_left, y_now), egui::pos2(entry_right, y_now)],
+                    egui::Stroke::new(2.0, egui::Color32::RED),
+                );
+                paint_badge(
+                    &painter,
+                    egui::pos2(rect.left() + 2.0, y_now - 1.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &Local::now().format("%H:%M").to_string(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::RED,
+                    egui::Color32::from_black_alpha(220),
+                );
+            }
+        }
+
+        if let Some(pos) = resp.hover_pos() {
+            if pos.x >= entry_left {
+                let hovered_secs = y_to_secs(pos.y);
+                let y_hover = pos.y.clamp(rect.top(), rect.bottom());
+                painter.line_segment(
+                    [egui::pos2(entry_left, y_hover), egui::pos2(entry_right, y_hover)],
+                    egui::Stroke::new(1.0, egui::Color32::WHITE),
+                );
+                paint_badge(
+                    &painter,
+                    egui::pos2(rect.left() + 2.0, y_hover - 1.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &fmt_secs(hovered_secs),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::WHITE,
+                    egui::Color32::from_black_alpha(220),
+                );
+            }
+        }
+
+        // ── Cursor: crosshair in past area, not-allowed in future area ────────
         if resp.hovered() {
             if let Some(pos) = resp.hover_pos() {
                 if pos.x >= entry_left {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let hovered_secs = y_to_secs(pos.y);
+                    if is_past_or_not_today(hovered_secs) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    } else {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                    }
                 }
             }
         }
@@ -421,27 +702,43 @@ fn draw_day_timeline(
     // Persist state
     ui.ctx().data_mut(|d| d.insert_temp(state_id, state));
 
-    // Request repaint while drag is live so ghost updates smoothly
+    // Request repaint while drag is live so ghost updates smoothly.
+    // On today's view, also schedule a repaint in ~30 s so the now-line and
+    // the live session block advance without requiring mouse movement.
     if resp.dragged() {
         ui.ctx().request_repaint();
+    }
+    if is_today {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(30));
     }
 }
 
 // ── Overlap helpers ───────────────────────────────────────────────────────────
 
-/// Insert `new` into `rows`, clipping away any time that already belongs to
-/// existing entries (draw mode: new entry must not overlap existing ones).
+/// Insert `new` into `rows`, clipping away overlapping time that already
+/// belongs to existing entries **on the same day**.
 ///
 /// Rules:
-/// - Any existing entry fully inside `new`'s range → deleted.
-/// - Existing entry whose end falls inside `new`'s range → trimmed: end = new.start.
-/// - Existing entry whose start falls inside `new`'s range → trimmed: start = new.end.
-/// - Existing entry that fully contains `new` → split into two (not implemented for
-///   simplicity; new entry is simply not inserted in that case to avoid overlap).
-fn clip_and_insert(rows: &mut Vec<WorktimeEntry>, new: WorktimeEntry) {
-    let mut to_add: Vec<WorktimeEntry> = Vec::new();
+/// - Existing entry fully inside `new` → deleted.
+/// - Existing entry partially overlapping `new` → trimmed.
+/// - Existing entry fully containing `new` → `new` is not inserted (no-op).
+fn clip_and_insert_for_day(rows: &mut Vec<WorktimeEntry>, new: WorktimeEntry, date: NaiveDate) {
+    // If any same-day entry fully contains `new`, do nothing.
+    let contained = rows.iter().any(|e| {
+        e.start.date_naive() == date
+            && e.start <= new.start
+            && e.end   >= new.end
+    });
+    if contained {
+        return;
+    }
+
+    let mut fragments: Vec<WorktimeEntry> = Vec::new();
 
     rows.retain_mut(|existing| {
+        if existing.start.date_naive() != date {
+            return true; // never touch other days
+        }
         let overlaps = existing.start < new.end && existing.end > new.start;
         if !overlaps {
             return true;
@@ -450,39 +747,70 @@ fn clip_and_insert(rows: &mut Vec<WorktimeEntry>, new: WorktimeEntry) {
         if existing.start >= new.start && existing.end <= new.end {
             return false;
         }
-        // Existing fully contains new → keep existing, don't insert new.
-        if existing.start <= new.start && existing.end >= new.end {
-            // Signal: abort insertion by marking new as zero-length (handled below).
-            return true; // keep existing as-is
-        }
-        // Existing start inside new range → push start to new.end.
-        if existing.start >= new.start && existing.start < new.end {
-            existing.start = new.end;
-            return true;
-        }
-        // Existing end inside new range → trim end to new.start.
-        if existing.end > new.start && existing.end <= new.end {
+        // Existing entry fully contains new → split into left + right fragments.
+        if existing.start < new.start && existing.end > new.end {
+            fragments.push(WorktimeEntry {
+                start: new.end,
+                end: existing.end,
+                comments: existing.comments.clone(),
+            });
             existing.end = new.start;
+            return existing.end > existing.start;
+        }
+        // Left overhang: trim the right end.
+        if existing.start < new.start && existing.end <= new.end {
+            existing.end = new.start;
+            return existing.end > existing.start;
+        }
+        // Right overhang: push start forward.
+        if existing.start >= new.start && existing.end > new.end {
+            existing.start = new.end;
             return existing.end > existing.start;
         }
         true
     });
 
-    // Only insert if there's no existing entry that fully contains new.
-    let contained = rows.iter().any(|e| e.start <= new.start && e.end >= new.end);
-    if !contained {
-        to_add.push(new);
-    }
-
-    for entry in to_add {
-        let pos = rows.partition_point(|r| r.start <= entry.start);
-        rows.insert(pos, entry);
-    }
+    rows.push(new);
+    rows.extend(fragments);
+    rows.sort_by_key(|r| r.start);
 }
 
-/// Remove all entries from `rows` that overlap with `new`.
-fn remove_overlapping(rows: &mut Vec<WorktimeEntry>, new: &WorktimeEntry) {
-    rows.retain(|e| !(e.start < new.end && e.end > new.start));
+fn extend_live_entry_for_day(
+    rows: &mut Vec<WorktimeEntry>,
+    new: &WorktimeEntry,
+    date: NaiveDate,
+    now_secs: Option<f32>,
+) -> bool {
+    let Some(now) = now_secs else {
+        return false;
+    };
+
+    let live_threshold = 60.0;
+    let new_end_secs = new.end.num_seconds_from_midnight() as f32;
+    if (new_end_secs - now).abs() > live_threshold {
+        return false;
+    }
+
+    if let Some(existing) = rows.iter_mut().find(|e| {
+        e.start.date_naive() == date
+            && (e.end.num_seconds_from_midnight() as f32 - now).abs() <= live_threshold
+            && new.start <= e.end
+    }) {
+        if new.end > existing.end {
+            existing.end = new.end;
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Remove all entries on `date` that overlap with `new`.
+fn remove_overlapping_for_day(rows: &mut Vec<WorktimeEntry>, new: &WorktimeEntry, date: NaiveDate) {
+    rows.retain(|e| {
+        e.start.date_naive() != date
+            || !(e.start < new.end && e.end > new.start)
+    });
 }
 
 /// Format seconds-from-midnight as "HH:MM".

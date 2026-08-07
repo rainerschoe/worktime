@@ -12,6 +12,7 @@ mod cli;
 use std::sync::*;
 use chrono::Datelike;
 use clap::Parser;
+use gtk;
 
 use crate::cli::Args;
 use crate::config::Config;
@@ -107,6 +108,13 @@ fn main() {
 
             // Wait for the monitoring thread to hand us the idle-gap receiver.
             let idle_gap_rx = rx_out_rx.recv().ok().flatten();
+
+            // GTK must be initialised on the main thread before eframe starts,
+            // because libappindicator (tray icon) requires the GTK event loop to
+            // run on the same thread that created it.  eframe/winit own the main
+            // thread event loop, so we init GTK here and pump it from inside
+            // the egui update() frame callback.
+            gtk::init().expect("Failed to initialise GTK");
 
             // Run the egui main app on the main thread (required by eframe).
             // The root viewport IS the main window; close hides it (minimize to tray).

@@ -14,19 +14,63 @@ pub struct Database {
 }
 
 impl Database {
-    /// if last element in database has same start time it is overwritten. otherwise new element is pushed
+    /// Commit an in-progress session.  If an entry with the same start time
+    /// already exists it is replaced (auto-save update); otherwise the entry
+    /// is inserted in chronological order so the vector stays sorted.
     pub fn commit_worktime(self: &mut Self, entry: WorktimeEntry) {
-        if self.rows.len() > 0 && self.rows[self.rows.len() - 1].start == entry.start {
-            self.rows.pop();
+        if let Some(pos) = self.rows.iter().position(|r| r.start == entry.start) {
+            self.rows[pos] = entry;
+        } else {
+            let pos = self.rows.partition_point(|r| r.start <= entry.start);
+            self.rows.insert(pos, entry);
         }
-        self.rows.push(entry);
     }
 
     /// Insert a worktime entry in chronological order (by start time).
-    /// Used when retroactively adding an idle gap as work time.
     pub fn insert_sorted(self: &mut Self, entry: WorktimeEntry) {
         let pos = self.rows.partition_point(|r| r.start <= entry.start);
         self.rows.insert(pos, entry);
+    }
+
+    /// Sort all rows by start time, then merge adjacent/overlapping entries
+    /// that have the same `comments` value (or at least one is empty), where
+    /// "adjacent" means the gap between them is ≤ `merge_gap_secs` seconds.
+    ///
+    /// This is called after every mutation to keep the database canonical.
+    pub fn normalize(&mut self, merge_gap_secs: i64) {
+        // 1. Sort.
+        self.rows.sort_by_key(|r| r.start);
+
+        if self.rows.is_empty() {
+            return;
+        }
+
+        // 2. Merge pass.
+        let mut merged: Vec<WorktimeEntry> = Vec::with_capacity(self.rows.len());
+        let mut current = self.rows[0].clone();
+
+        for next in self.rows.iter().skip(1) {
+            let gap = (next.start - current.end).num_seconds();
+            let comments_compatible = current.comments.is_empty()
+                || next.comments.is_empty()
+                || current.comments == next.comments;
+
+            if gap <= merge_gap_secs && comments_compatible {
+                // Merge: extend current to cover next.
+                if next.end > current.end {
+                    current.end = next.end;
+                }
+                // Keep the non-empty comment (prefer current's if both set).
+                if current.comments.is_empty() && !next.comments.is_empty() {
+                    current.comments = next.comments.clone();
+                }
+            } else {
+                merged.push(current);
+                current = next.clone();
+            }
+        }
+        merged.push(current);
+        self.rows = merged;
     }
 
     pub fn init(
@@ -65,6 +109,7 @@ impl Database {
             return Ok(db);
         }
         db.rows.sort();
+        db.normalize(60); // repair any pre-existing corruption in the CSV
 
         // load special days:
         let rdr = csv::Reader::from_path(path_special_days.clone());
@@ -360,6 +405,106 @@ impl Database {
         );
     }
 
+    /// Print the vertical timeline from a pre-cloned rows snapshot.
+    /// This takes a `Vec` rather than `&self` so the caller can release the
+    /// database mutex before calling this (which may do significant I/O).
+    pub fn print_timeline_from_rows(
+        rows: &[WorktimeEntry],
+        now: chrono::DateTime<chrono::Local>,
+        current_session_start: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        let (day_start, day_end) = Self::get_day_bounds(now);
+        let (week_start, week_end) = Self::get_week_bounds(now);
+
+        // Filter to today's entries (mirroring what query() does but on a slice).
+        let today: Vec<WorktimeEntry> = rows.iter()
+            .filter(|e| {
+                (e.start >= day_start && e.start < day_end)
+                || (e.end > day_start && e.end <= day_end)
+            })
+            .map(|e| WorktimeEntry {
+                start: e.start.max(day_start),
+                end:   e.end.min(day_end),
+                comments: e.comments.clone(),
+            })
+            .collect();
+
+        let mut previous_entry: Option<WorktimeEntry> = None;
+        let mut day_sum = chrono::Duration::seconds(0);
+        for entry in &today {
+            if let Some(ref prev) = previous_entry {
+                print!("\x1b[38;5;250m");
+                Self::print_filler(prev.end, entry.start, "");
+                print!("\x1b[0m");
+                println!("\x1b[32m| {} Start working (after {} break)\x1b[0m",
+                    entry.start.format("%T"),
+                    format_chrono_duration(&(entry.start - prev.end)));
+            } else {
+                println!("\x1b[32m| {} Start working\x1b[0m", entry.start.format("%T"));
+            }
+            print!("\x1b[32m");
+            Self::print_filler(entry.start, entry.end, "X");
+            println!("| {} Stopped working (after {})\x1b[0m",
+                entry.end.format("%T"),
+                format_chrono_duration(&entry.duration()));
+            day_sum = day_sum + entry.duration();
+            previous_entry = Some(entry.clone());
+        }
+        print!("\x1b[0m");
+
+        if let Some(session_start) = current_session_start {
+            let current_duration = now - session_start;
+            if session_start >= day_start {
+                if let Some(ref prev) = previous_entry {
+                    print!("\x1b[38;5;250m");
+                    Self::print_filler(prev.end, session_start, "");
+                    print!("\x1b[0m");
+                    println!("\x1b[32m| {} Start working (after {} break)\x1b[0m",
+                        session_start.format("%T"),
+                        format_chrono_duration(&(session_start - prev.end)));
+                } else {
+                    println!("\x1b[32m| {} Start working\x1b[0m", session_start.format("%T"));
+                }
+                print!("\x1b[33m");
+                Self::print_filler(session_start, now, "~");
+                println!("| {} Working... ({})\x1b[0m",
+                    now.format("%T"),
+                    format_chrono_duration(&current_duration));
+                day_sum = day_sum + current_duration;
+            }
+        }
+
+        // Week sum from the cloned slice.
+        let week_sum: chrono::Duration = rows.iter()
+            .filter(|e| {
+                (e.start >= week_start && e.start < week_end)
+                || (e.end > week_start && e.end <= week_end)
+            })
+            .map(|e| {
+                let s = e.start.max(week_start);
+                let t = e.end.min(week_end);
+                t - s
+            })
+            .fold(chrono::Duration::seconds(0), |a, d| a + d);
+
+        // Add current session to week sum if it started this week.
+        let week_sum = if let Some(session_start) = current_session_start {
+            if session_start >= week_start {
+                week_sum + (now - session_start)
+            } else {
+                week_sum
+            }
+        } else {
+            week_sum
+        };
+
+        println!(
+            "Current: Day: {}, Week: {}",
+            format_chrono_duration(&day_sum),
+            format_chrono_duration(&week_sum),
+        );
+    }
+
     pub fn get_day_sum(self: &Self, day: chrono::DateTime<chrono::offset::Local>) -> chrono::Duration {
         let mut day_sum = chrono::Duration::seconds(0);
         for entry in self.query(Self::get_day_bounds(day)) {
@@ -453,6 +598,112 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_db(rows: Vec<WorktimeEntry>) -> Database {
+        Database {
+            rows,
+            special_days: vec![],
+            path: std::path::PathBuf::new(),
+            file_access_lock: named_lock::NamedLock::create("dummy_normalize").unwrap(),
+        }
+    }
+
+    fn entry(start: &str, end: &str) -> WorktimeEntry {
+        WorktimeEntry {
+            start: start.parse().unwrap(),
+            end:   end.parse().unwrap(),
+            comments: String::new(),
+        }
+    }
+
+    fn entry_c(start: &str, end: &str, c: &str) -> WorktimeEntry {
+        WorktimeEntry {
+            start: start.parse().unwrap(),
+            end:   end.parse().unwrap(),
+            comments: c.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_normalize_sorts() {
+        let mut db = make_db(vec![
+            entry("2024-01-02T10:00:00+01:00", "2024-01-02T11:00:00+01:00"),
+            entry("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00"),
+        ]);
+        db.normalize(60);
+        assert_eq!(db.rows[0].start.format("%H:%M").to_string(), "08:00");
+        assert_eq!(db.rows[1].start.format("%H:%M").to_string(), "10:00");
+    }
+
+    #[test]
+    fn test_normalize_merges_adjacent_within_gap() {
+        // Gap of 30s between entries — should merge (threshold 60s).
+        let mut db = make_db(vec![
+            entry("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00"),
+            entry("2024-01-02T09:00:30+01:00", "2024-01-02T10:00:00+01:00"),
+        ]);
+        db.normalize(60);
+        assert_eq!(db.rows.len(), 1);
+        assert_eq!(db.rows[0].start.format("%H:%M").to_string(), "08:00");
+        assert_eq!(db.rows[0].end.format("%H:%M").to_string(), "10:00");
+    }
+
+    #[test]
+    fn test_normalize_no_merge_beyond_gap() {
+        // Gap of 2 minutes — should NOT merge (threshold 60s).
+        let mut db = make_db(vec![
+            entry("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00"),
+            entry("2024-01-02T09:02:00+01:00", "2024-01-02T10:00:00+01:00"),
+        ]);
+        db.normalize(60);
+        assert_eq!(db.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_normalize_merges_overlapping() {
+        let mut db = make_db(vec![
+            entry("2024-01-02T08:00:00+01:00", "2024-01-02T09:30:00+01:00"),
+            entry("2024-01-02T09:00:00+01:00", "2024-01-02T10:00:00+01:00"),
+        ]);
+        db.normalize(60);
+        assert_eq!(db.rows.len(), 1);
+        assert_eq!(db.rows[0].end.format("%H:%M").to_string(), "10:00");
+    }
+
+    #[test]
+    fn test_normalize_no_merge_different_comments() {
+        let mut db = make_db(vec![
+            entry_c("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00", "meeting"),
+            entry_c("2024-01-02T09:00:30+01:00", "2024-01-02T10:00:00+01:00", "coding"),
+        ]);
+        db.normalize(60);
+        // Both have non-empty, different comments → not merged.
+        assert_eq!(db.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_normalize_merges_empty_comment_with_nonempty() {
+        let mut db = make_db(vec![
+            entry_c("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00", "meeting"),
+            entry_c("2024-01-02T09:00:30+01:00", "2024-01-02T10:00:00+01:00", ""),
+        ]);
+        db.normalize(60);
+        assert_eq!(db.rows.len(), 1);
+        assert_eq!(db.rows[0].comments, "meeting");
+    }
+
+    #[test]
+    fn test_normalize_idempotent() {
+        let mut db = make_db(vec![
+            entry("2024-01-02T08:00:00+01:00", "2024-01-02T09:00:00+01:00"),
+            entry("2024-01-02T10:00:00+01:00", "2024-01-02T11:00:00+01:00"),
+        ]);
+        db.normalize(60);
+        let rows_after_first = db.rows.clone();
+        db.normalize(60);
+        assert_eq!(db.rows, rows_after_first);
+    }
+
 
     #[test]
     fn test_overtime_empty_db_empty_range() {
