@@ -31,8 +31,8 @@ egui = "0.35"
 # gtk feature pulls libappindicator for Linux tray support.
 # libxdo feature (for predefined Copy/Paste items) is NOT enabled — libxdo-devel not installed.
 tray-icon = { version = "0.24", default-features = false, features = ["gtk"] }
-gtk = "0.18"     # already pulled transitively by tray-icon/muda; needed for gtk::init()
-gtk-sys = "0.18" # for gtk_events_pending / gtk_main_iteration_do
+gtk  = "0.18"   # needed for gtk::init() and gtk::main()
+glib = "0.18"   # for glib::timeout_add_local (badge polling in GTK thread)
 once_cell = "1"
 
 # Linux-specific dependencies for idle detection

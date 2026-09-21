@@ -1,32 +1,28 @@
-use std::sync::*;
+//! Background monitoring: idle detection, auto-save, SIGINT handler.
+//!
+//! This module runs entirely on a background thread.  It communicates with the
+//! rest of the application only through:
+//!   - `DbHandle`  — a cheap-to-clone handle whose mutex is locked only briefly
+//!   - `mpsc` channels — for sending idle-gap events to the UI thread
+
 use std::thread;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use crate::config::Config;
-use crate::database::Database;
-use crate::idle_detection::{ActivityRecorder, create_idle_detector};
+use crate::database::DbHandle;
+use crate::idle_detection::{ActivityRecorder, WorkSession, create_idle_detector};
 use crate::idle_popup::IdleGapInfo;
 use crate::utils::format_chrono_duration;
 
-/// Set up idle detection, auto-save, and SIGINT handler, then hand the
-/// idle-gap `Receiver` back to the caller via `rx_out` before entering the
-/// blocking terminal-status loop.
+/// Start idle detection and auto-save on the calling (background) thread.
 ///
-/// Call this on a **background thread**.  The function blocks forever (until
-/// SIGINT / process exit).  The `rx_out` sender fires exactly once, before the
-/// blocking loop starts, so the caller can retrieve the receiver without any
-/// race condition.
-pub fn run_interactive_monitoring(
-    database: Arc<Mutex<Database>>,
+/// Returns the channel receiver the UI thread should poll for idle-gap events.
+/// Blocks forever — call from a `thread::spawn`.
+pub fn run_monitoring(
+    db: DbHandle,
     cfg: &Config,
-    rx_out: std::sync::mpsc::SyncSender<Option<std::sync::mpsc::Receiver<IdleGapInfo>>>,
-) {
-    // ── Idle-gap popup channel ───────────────────────────────────────────────
-    // When ask_on_idle is enabled, the recorder sends IdleGapInfo over this
-    // channel.  The receiver is passed back to the UI thread via rx_out.
-    let (idle_gap_tx_for_recorder, idle_gap_rx): (
-        Option<std::sync::mpsc::Sender<IdleGapInfo>>,
-        Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
-    ) = if cfg.ask_on_idle {
+) -> Option<std::sync::mpsc::Receiver<IdleGapInfo>> {
+    // ── Idle-gap channel (UI thread receives gap events) ─────────────────────
+    let (idle_gap_tx, gap_rx_opt) = if cfg.ask_on_idle {
         let (tx, rx) = std::sync::mpsc::channel::<IdleGapInfo>();
         (Some(tx), Some(rx))
     } else {
@@ -34,125 +30,73 @@ pub fn run_interactive_monitoring(
     };
 
     // ── Activity recorder ────────────────────────────────────────────────────
-    let activity_recorder = Arc::new(Mutex::new(ActivityRecorder::new(
-        database.clone(),
-        idle_gap_tx_for_recorder,
-    )));
-
-    // Mutex used to synchronise auto-save with SIGINT handling.
-    let file_mutex_signal    = Arc::new(Mutex::new(()));
-    let file_mutex_auto_save = file_mutex_signal.clone();
+    // Owns its own internal state; takes DbHandle (lock held only per-call).
+    let recorder = ActivityRecorder::new(db.clone(), idle_gap_tx);
 
     // ── Idle detector ────────────────────────────────────────────────────────
-    let mut idle_detector = create_idle_detector(cfg.timeout_minutes)
+    let mut detector = create_idle_detector(cfg.timeout_minutes)
         .unwrap_or_else(|e| {
             eprintln!("Failed to create idle detector:\n{}", e);
             std::process::exit(1);
         });
 
-    let activity_recorder_on_end   = activity_recorder.clone();
-    let activity_recorder_on_start = activity_recorder.clone();
-    idle_detector
-        .start_monitoring(
-            Box::new(move |session| {
-                activity_recorder_on_end
-                    .lock()
-                    .unwrap()
-                    .handle_session(session);
-            }),
-            Box::new(move |session_start| {
-                activity_recorder_on_start
-                    .lock()
-                    .unwrap()
-                    .notify_session_start(session_start);
-            }),
-        )
-        .expect("Failed to start idle monitoring");
+    // The detector fires callbacks on its own internal thread.
+    // We wrap the recorder in an Arc<Mutex> only here, so the callbacks can
+    // call it — the lock is held only for the duration of one short method.
+    let recorder = std::sync::Arc::new(std::sync::Mutex::new(recorder));
+    let rec_end   = recorder.clone();
+    let rec_start = recorder.clone();
 
-    let idle_detector_ref = Arc::new(Mutex::new(idle_detector));
+    detector.start_monitoring(
+        Box::new(move |session: WorkSession| {
+            rec_end.lock().unwrap().handle_session(session);
+        }),
+        Box::new(move |start| {
+            rec_start.lock().unwrap().notify_session_start(start);
+        }),
+    ).expect("Failed to start idle monitoring");
 
     // ── SIGINT handler ───────────────────────────────────────────────────────
-    let database_signals          = database.clone();
-    let idle_detector_signals     = idle_detector_ref.clone();
-    let activity_recorder_signals = activity_recorder.clone();
+    let db_sig  = db.clone();
+    let det_sig = std::sync::Arc::new(std::sync::Mutex::new(detector));
+    let rec_sig = recorder.clone();
+    let det_sig2 = det_sig.clone();
     thread::spawn(move || {
         let mut signals = Signals::new(&[SIGINT]).unwrap();
-        for sig in signals.forever() {
-            println!("Received signal {:?}", sig);
-
-            let detector = idle_detector_signals.lock().unwrap();
-            if let Some(session) = detector.get_current_session() {
-                activity_recorder_signals
-                    .lock()
-                    .unwrap()
-                    .commit_session(session);
+        for _sig in signals.forever() {
+            let session = det_sig2.lock().unwrap().get_current_session();
+            if let Some(s) = session {
+                rec_sig.lock().unwrap().commit_session(s);
             }
-
-            println!("Saving worktimes into data file...");
-            database_signals.lock().unwrap().store_file().unwrap();
-            let _lock = file_mutex_signal.lock();
+            let _ = db_sig.store_file();
             std::process::exit(0);
         }
     });
 
-    // ── Auto-save ────────────────────────────────────────────────────────────
-    let database_autosave          = database.clone();
-    let idle_detector_autosave     = idle_detector_ref.clone();
-    let activity_recorder_autosave = activity_recorder.clone();
-    let auto_save_interval_seconds = cfg.auto_save_interval_seconds;
+    // ── Auto-save loop ───────────────────────────────────────────────────────
+    let db_save  = db.clone();
+    let det_save = det_sig.clone();
+    let rec_save = recorder.clone();
+    let interval = cfg.auto_save_interval_seconds;
     thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(auto_save_interval_seconds));
-        let _lock = file_mutex_auto_save.lock();
-        if let Some(session) = idle_detector_autosave.lock().unwrap().get_current_session() {
-            activity_recorder_autosave.lock().unwrap().commit_session(session);
+        thread::sleep(std::time::Duration::from_secs(interval));
+        let session = det_save.lock().unwrap().get_current_session();
+        if let Some(s) = session {
+            rec_save.lock().unwrap().commit_session(s);
         }
-        println!("Auto-Save");
-        database_autosave.lock().unwrap().store_file().unwrap();
+        let _ = db_save.store_file();
+        eprintln!("Auto-Save");
     });
 
-    // ── Hand the gap receiver back to the UI thread ──────────────────────────
-    // This fires before the blocking loop below, so the UI thread never waits.
-    let _ = rx_out.send(idle_gap_rx);
-
-    // ── Live terminal status loop (blocks forever) ───────────────────────────
-    let overtime_end: chrono::DateTime<chrono::offset::Local> =
-        std::time::SystemTime::now().into();
-    let overtime = database.lock().unwrap().calculate_overtime(
-        chrono::Duration::hours(cfg.weekly_hours),
-        (cfg.cutoff_datetime, overtime_end),
-    ) + chrono::Duration::seconds((cfg.cutoff_day_overtime_hours * 3600.0) as i64);
+    // ── Terminal status loop ─────────────────────────────────────────────────
+    let overtime_end: chrono::DateTime<chrono::offset::Local> = std::time::SystemTime::now().into();
+    let overtime = db.with(|d| {
+        d.calculate_overtime(
+            chrono::Duration::hours(cfg.weekly_hours),
+            (cfg.cutoff_datetime, overtime_end),
+        )
+    }) + chrono::Duration::seconds((cfg.cutoff_day_overtime_hours * 3600.0) as i64);
     println!("overtime: {}", format_chrono_duration(&overtime));
 
-    loop {
-        thread::sleep(std::time::Duration::from_secs(2));
-        println!("---");
-
-        // Hold each lock only long enough to copy the values out.
-        // Holding database.lock() across the print calls would block the UI
-        // thread (which also locks the database every frame) for up to 2 s.
-        let (current_start, idle_duration) = {
-            let detector = idle_detector_ref.lock().unwrap();
-            let current_start = detector.get_current_session().map(|s| s.start);
-            let idle_duration = detector.get_idle_duration();
-            (current_start, idle_duration)
-        };
-
-        let (rows, now) = {
-            let db = database.lock().unwrap();
-            (db.rows.clone(), chrono::Local::now())
-        };
-        Database::print_timeline_from_rows(&rows, now, current_start);
-
-        if let Some(idle_dur) = idle_duration {
-            let idle_secs = idle_dur.num_seconds();
-            if idle_secs < 60 {
-                println!("Active ({}s since last input)", idle_secs);
-            } else {
-                let idle_mins = idle_secs / 60;
-                println!("Idle for {}m {}s", idle_mins, idle_secs % 60);
-            }
-        } else {
-            println!("No activity detected yet");
-        }
-    }
+    gap_rx_opt
 }

@@ -1,10 +1,9 @@
 //! Day view: date navigation bar + interactive vertical day timeline.
 
-use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime,
              NaiveTime, TimeZone, Timelike, Weekday};
 use eframe::egui;
-use crate::database::Database;
+use crate::database::DbHandle;
 use crate::models::WorktimeEntry;
 
 // ── Duration formatting helper ────────────────────────────────────────────────
@@ -27,7 +26,7 @@ fn fmt_duration(d: Duration) -> String {
 pub fn draw_day_view(
     ui: &mut egui::Ui,
     selected_date: &mut NaiveDate,
-    database: &Arc<Mutex<Database>>,
+    database: &DbHandle,
 ) {
     // ── Date navigation row ───────────────────────────────────────────────────
     ui.horizontal(|ui| {
@@ -144,13 +143,11 @@ const PPH_MAX:      f32  = 400.0;
 fn draw_day_timeline(
     ui:       &mut egui::Ui,
     date:      NaiveDate,
-    database: &Arc<Mutex<Database>>,
+    database: &DbHandle,
 ) {
     // Always read fresh so the live session end-time is never stale.
     let (day_start, day_end) = day_bounds(date);
-    let entries: Vec<WorktimeEntry> = database.lock().unwrap()
-        .query((day_start, day_end))
-        .collect();
+    let entries: Vec<WorktimeEntry> = database.query_range((day_start, day_end));
     let entries = entries.as_slice();
 
     let state_id = ui.id().with("tl_state");
@@ -289,22 +286,21 @@ fn draw_day_timeline(
                 let end_dt   = secs_to_dt(date, hi);
                 let new_entry = WorktimeEntry { start: start_dt, end: end_dt, comments: String::new() };
 
-                let mut db = database.lock().unwrap();
-                match drag.mode {
-                    DragMode::Draw => {
-                        if !extend_live_entry_for_day(&mut db.rows, &new_entry, date, now_secs) {
-                            // Only clip against entries for this day.
-                            clip_and_insert_for_day(&mut db.rows, new_entry, date);
+                database.with_mut(|db| {
+                    match drag.mode {
+                        DragMode::Draw => {
+                            if !extend_live_entry_for_day(&mut db.rows, &new_entry, date, now_secs) {
+                                clip_and_insert_for_day(&mut db.rows, new_entry, date);
+                            }
+                        }
+                        DragMode::Replace => {
+                            remove_overlapping_for_day(&mut db.rows, &new_entry, date);
+                            db.insert_sorted(new_entry);
                         }
                     }
-                    DragMode::Replace => {
-                        // Remove overlapping entries for this day only.
-                        remove_overlapping_for_day(&mut db.rows, &new_entry, date);
-                        db.insert_sorted(new_entry);
-                    }
-                }
-                db.normalize(60);
-                let _ = db.store_file();
+                    db.normalize(60);
+                    let _ = db.store_file();
+                });
                 db_changed = true;
             }
         }
@@ -330,7 +326,7 @@ fn draw_day_timeline(
     //  to re-query when the user just drew/deleted something this very frame.)
     let entries_updated: Vec<WorktimeEntry>;
     let entries = if db_changed {
-        entries_updated = database.lock().unwrap().query((day_start, day_end)).collect();
+        entries_updated = database.query_range((day_start, day_end));
         entries_updated.as_slice()
     } else {
         entries
@@ -361,13 +357,7 @@ fn draw_day_timeline(
                         if ui.button("Delete").clicked() {
                             let start = entry.start;
                             let end   = entry.end;
-                            let mut db = database.lock().unwrap();
-                            // `entry` may be a day-clipped view of a row that spans midnight.
-                            // Match the row that fully contains [start, end] rather than
-                            // requiring an exact timestamp match on both ends.
-                            db.rows.retain(|r| !(r.start <= start && r.end >= end));
-                            db.normalize(60);
-                            let _ = db.store_file();
+                            database.delete_entry(start, end);
                             state.pending_delete = None;
                             db_changed = true;
                         }

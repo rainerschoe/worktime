@@ -13,7 +13,7 @@ use crate::utils::format_chrono_duration;
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdleGapAnswer {
     /// The gap was entirely work time — insert the full gap into the database.
-    WorkTime,
+    WorkTime { gap_start: DateTime<Local>, gap_end: DateTime<Local> },
     /// The gap was genuinely idle — do nothing.
     Idle,
     /// The user selected a sub-range of the gap as work time.
@@ -83,7 +83,10 @@ pub fn draw_idle_popup(ui: &mut egui::Ui, state: &mut IdlePopupState) {
         if ui.add_sized([145.0, 36.0],
             egui::Button::new(egui::RichText::new("✔  All Work Time").size(14.0))
         ).clicked() {
-            state.answer = Some(IdleGapAnswer::WorkTime);
+            state.answer = Some(IdleGapAnswer::WorkTime {
+                gap_start: state.gap.gap_start,
+                gap_end:   state.gap.gap_end,
+            });
         }
         ui.add_space(8.0);
         if ui.add_sized([130.0, 36.0],
@@ -399,7 +402,10 @@ impl eframe::App for IdlePopupApp {
                 egui::Button::new(egui::RichText::new("✔  All Work Time").size(14.0)),
             );
             if all_work_btn.clicked() {
-                self.answer = Some(IdleGapAnswer::WorkTime);
+                self.answer = Some(IdleGapAnswer::WorkTime {
+                    gap_start: self.gap.gap_start,
+                    gap_end:   self.gap.gap_end,
+                });
             }
 
             ui.add_space(8.0);

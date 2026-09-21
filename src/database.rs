@@ -1,10 +1,92 @@
 use std::error::Error;
+use std::sync::{Arc, Mutex};
 use chrono::Datelike;
 use chrono::Timelike;
 use chrono::{offset::TimeZone, Local};
 #[allow(unused_imports)]
 use crate::models::{WorktimeEntry, SpecialDayEntry, SpecialDayType};
 use crate::utils::format_chrono_duration;
+
+// ── DbHandle ──────────────────────────────────────────────────────────────────
+//
+// A cheaply-cloneable handle to the shared database.  The internal mutex is an
+// implementation detail; callers never hold it across function boundaries.
+
+#[derive(Clone)]
+pub struct DbHandle(Arc<Mutex<Database>>);
+
+impl DbHandle {
+    pub fn open(
+        path: std::path::PathBuf,
+        special_days_path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        Database::init(path, special_days_path).map(|db| Self(Arc::new(Mutex::new(db))))
+    }
+
+    /// Commit a work session (insert or replace by start time).
+    pub fn commit_worktime(&self, entry: WorktimeEntry) {
+        self.0.lock().unwrap().commit_worktime(entry);
+    }
+
+    /// Insert a new entry in sorted order then normalize.
+    pub fn insert_and_normalize(&self, entry: WorktimeEntry) {
+        let mut db = self.0.lock().unwrap();
+        db.insert_sorted(entry);
+        db.normalize(60);
+    }
+
+    /// Flush rows to disk.
+    pub fn store_file(&self) -> Result<(), Box<dyn Error>> {
+        self.0.lock().unwrap().store_file()
+    }
+
+    /// Auto-save: commit the current in-progress session then flush.
+    pub fn autosave(&self, entry: Option<WorktimeEntry>) {
+        let mut db = self.0.lock().unwrap();
+        if let Some(e) = entry {
+            db.commit_worktime(e);
+        }
+        let _ = db.store_file();
+    }
+
+    /// Return today's worked minutes (for tray badge).
+    pub fn today_minutes(&self) -> u32 {
+        let db = self.0.lock().unwrap();
+        db.get_day_sum(Local::now()).num_minutes() as u32
+    }
+
+    /// Query entries overlapping a time range (clipped to range boundaries).
+    pub fn query_range(
+        &self,
+        range: (chrono::DateTime<Local>, chrono::DateTime<Local>),
+    ) -> Vec<WorktimeEntry> {
+        self.0.lock().unwrap().query(range).collect()
+    }
+
+    /// Delete the database row that fully contains the given [start, end] interval.
+    /// Used by the day-view delete action to handle day-boundary-spanning entries.
+    pub fn delete_entry(&self, start: chrono::DateTime<Local>, end: chrono::DateTime<Local>) {
+        let mut db = self.0.lock().unwrap();
+        db.rows.retain(|r| !(r.start <= start && r.end >= end));
+        db.normalize(60);
+        let _ = db.store_file();
+    }
+
+    /// Mutate rows directly for the day-view drawing/editing operations.
+    /// The closure receives `&mut Database` and must complete quickly.
+    pub fn with_mut<F, R>(&self, f: F) -> R
+    where F: FnOnce(&mut Database) -> R {
+        f(&mut self.0.lock().unwrap())
+    }
+
+    /// Read-only access for queries/calculations that need multiple fields.
+    pub fn with<F, R>(&self, f: F) -> R
+    where F: FnOnce(&Database) -> R {
+        f(&self.0.lock().unwrap())
+    }
+}
+
+// ── Database internals ────────────────────────────────────────────────────────
 
 pub struct Database {
     path: std::path::PathBuf,

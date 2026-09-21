@@ -1,127 +1,133 @@
-//! Main egui application — owns the tray icon, the main window, and
-//! the idle-gap popup dispatch.
+//! Main egui application — day view + tray icon.
 //!
-//! Architecture:
-//! - The root eframe viewport IS the main window (day view).
-//! - Closing the window hides it to tray (sets `window_visible = false` and
-//!   calls `ViewportCommand::Minimized(true)`); the window is not destroyed.
-//! - Clicking the tray icon un-hides the window.
-//! - GTK is initialised on the MAIN thread (required by libappindicator).
-//!   The GTK event loop is pumped inside every egui frame so tray events and
-//!   popup input events are processed at full frame-rate, not at the old 100 ms
-//!   background-thread polling interval.
+//! Threading model:
+//!   - Main thread: eframe/egui event loop (this file)
+//!   - GTK/tray thread: dedicated thread running gtk_main (tray icon)
+//!   - Monitoring thread: idle detection, auto-save (monitoring.rs)
+//!
+//! Communication:
+//!   - Monitoring → UI:   mpsc channel of IdleGapInfo
+//!   - Popup:             rendered as immediate sub-viewport on the main thread
+//!   - Tray → UI:         tray_icon event channels (try_recv each frame)
 
-use std::sync::{Arc, Mutex};
 use chrono::{Local, NaiveDate};
-
 use eframe::egui;
-use crate::database::Database;
-use crate::idle_popup::IdleGapInfo;
+use crate::database::DbHandle;
+use crate::idle_popup::{IdleGapInfo, IdleGapAnswer, IdlePopupState, draw_idle_popup};
+use std::sync::{Mutex, OnceLock};
 
-// ── Static menu-item IDs ──────────────────────────────────────────────────────
+// ── Tray icon ─────────────────────────────────────────────────────────────────
 
 static QUIT_ITEM_ID: once_cell::sync::OnceCell<tray_icon::menu::MenuId> =
     once_cell::sync::OnceCell::new();
 static OPEN_ITEM_ID: once_cell::sync::OnceCell<tray_icon::menu::MenuId> =
     once_cell::sync::OnceCell::new();
 
+/// Spawn a dedicated GTK thread that owns the tray icon.
+/// GTK must run on its own thread; eframe/winit owns the main thread.
+fn spawn_tray_thread() {
+    // Initialise the badge slot before spawning so the GTK thread can find it.
+    PENDING_BADGE.get_or_init(|| Mutex::new(None));
+
+    std::thread::spawn(|| {
+        gtk::init().expect("Failed to initialise GTK for tray icon");
+
+        let open_item = tray_icon::menu::MenuItem::new("Open worktime", true, None);
+        let quit_item = tray_icon::menu::MenuItem::new("Quit", true, None);
+        let tray_menu = tray_icon::menu::Menu::new();
+        tray_menu.append(&open_item).unwrap();
+        tray_menu.append(&quit_item).unwrap();
+        let _ = QUIT_ITEM_ID.set(quit_item.id().clone());
+        let _ = OPEN_ITEM_ID.set(open_item.id().clone());
+
+        let icon = solid_icon(32, 32, 80, 80, 80);
+        let tray = tray_icon::TrayIconBuilder::new()
+            .with_icon(icon)
+            .with_tooltip("worktime")
+            .with_menu(Box::new(tray_menu))
+            .build()
+            .expect("Failed to build tray icon");
+
+        // Poll badge updates from the egui thread every second via a GLib timeout.
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            if let Some(cell) = PENDING_BADGE.get() {
+                if let Some(payload) = cell.lock().unwrap().take() {
+                    if let Ok(icon) = tray_icon::Icon::from_rgba(payload.rgba, 32, 32) {
+                        let _ = tray.set_icon(Some(icon));
+                    }
+                    let _ = tray.set_tooltip(Some(payload.tooltip));
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+
+        // GTK main loop — drives tray icon, its menu, and the badge timeout.
+        gtk::main();
+    });
+}
+
+fn solid_icon(w: u32, h: u32, r: u8, g: u8, b: u8) -> tray_icon::Icon {
+    let rgba: Vec<u8> = std::iter::repeat([r, g, b, 255u8])
+        .take((w * h) as usize)
+        .flatten()
+        .collect();
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon")
+}
+
 // ── MainApp ───────────────────────────────────────────────────────────────────
 
 pub struct MainApp {
-    pub database:    Arc<Mutex<Database>>,
-    pub idle_gap_rx: Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
+    db:           DbHandle,
+    /// Receives idle-gap events from the monitoring thread.
+    gap_rx:       Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
+    /// Pending idle-gap popup, if any.
+    idle_popup:   Option<IdlePopupState>,
 
-    /// Queue of popup states waiting to be shown. We show one at a time.
-    pending_popups: std::collections::VecDeque<crate::idle_popup::IdlePopupState>,
-
-    /// Whether the window should be visible. When false we keep it minimized.
-    window_visible:  bool,
-    pub selected_date: NaiveDate,
-
-    /// The tray icon, kept alive for the duration of the app.
-    tray:               Option<tray_icon::TrayIcon>,
+    selected_date:      NaiveDate,
     last_badge_label:   Option<String>,
     daily_target_hours: u32,
 }
 
 impl MainApp {
     pub fn new(
-        database: Arc<Mutex<Database>>,
-        idle_gap_rx: Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
+        db: DbHandle,
+        gap_rx: Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
         daily_target_hours: u32,
         _cc: &eframe::CreationContext<'_>,
     ) -> Self {
-        // GTK must already have been initialised on the main thread by the
-        // caller (main.rs) before eframe::run_native was invoked.
-
-        let open_item = tray_icon::menu::MenuItem::new("Open worktime", true, None);
-        let quit_item = tray_icon::menu::MenuItem::new("Quit",          true, None);
-        let tray_menu = tray_icon::menu::Menu::new();
-        tray_menu.append(&open_item).unwrap();
-        tray_menu.append(&quit_item).unwrap();
-
-        let _ = QUIT_ITEM_ID.set(quit_item.id().clone());
-        let _ = OPEN_ITEM_ID.set(open_item.id().clone());
-
-        let icon = make_tray_icon_rgba(32, 32, 80, 80, 80);
-        let tray = tray_icon::TrayIconBuilder::new()
-            .with_icon(icon)
-            .with_tooltip("worktime")
-            .with_menu(Box::new(tray_menu))
-            .build()
-            .ok(); // soft-fail: tray unavailable in some environments
-
+        spawn_tray_thread();
         Self {
-            database,
-            idle_gap_rx,
-            pending_popups: std::collections::VecDeque::new(),
-            window_visible: true,
+            db,
+            gap_rx,
+            idle_popup: None,
             selected_date: Local::now().date_naive(),
-            tray,
             last_badge_label: None,
             daily_target_hours,
         }
     }
 }
 
-// ── eframe::App impl ─────────────────────────────────────────────────────────
+// ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
 
-        // ── Pump the GTK event loop ───────────────────────────────────────────
-        // This must happen on the main thread (where GTK was initialised).
-        // Draining all pending GTK events every egui frame ensures tray-menu
-        // clicks and popup window input are processed at full frame-rate.
-        unsafe {
-            while gtk_sys::gtk_events_pending() != 0 {
-                gtk_sys::gtk_main_iteration_do(0);
-            }
-        }
-
-        // ── Handle window close → hide to tray instead of quitting ────────────
+        // ── Hide to tray on close ─────────────────────────────────────────────
         if ui.ctx().input(|i| i.viewport().close_requested()) {
-            // Cancel the close and minimize instead.
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.window_visible = false;
         }
 
-        // ── Poll tray icon click events (non-Linux; Linux uses menu) ──────────
+        // ── Tray events ───────────────────────────────────────────────────────
         while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                event,
-                tray_icon::TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    button_state: tray_icon::MouseButtonState::Up,
-                    ..
-                } | tray_icon::TrayIconEvent::DoubleClick { .. }
-            ) {
+            if matches!(event,
+                tray_icon::TrayIconEvent::Click { button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up, .. }
+                | tray_icon::TrayIconEvent::DoubleClick { .. })
+            {
                 self.show_window(ui.ctx());
             }
         }
-
-        // ── Poll tray menu events ─────────────────────────────────────────────
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if QUIT_ITEM_ID.get().map_or(false, |id| event.id == *id) {
                 std::process::exit(0);
@@ -131,133 +137,101 @@ impl eframe::App for MainApp {
             }
         }
 
-        // ── Poll idle-gap channel → queue popups ──────────────────────────────
-        if let Some(ref rx) = self.idle_gap_rx {
+        // ── Drain idle-gap channel → queue popup (only one at a time) ─────────
+        if let Some(ref rx) = self.gap_rx {
             while let Ok(gap) = rx.try_recv() {
-                self.pending_popups.push_back(
-                    crate::idle_popup::IdlePopupState::new(gap)
-                );
+                // If a popup is already visible, discard older gaps so we never
+                // stack multiple windows.  (In practice only one gap fires at a
+                // time, but guard it anyway.)
+                if self.idle_popup.is_none() {
+                    self.idle_popup = Some(IdlePopupState::new(gap));
+                }
             }
         }
 
-        // ── Show the front popup as an immediate sub-viewport ─────────────────
-        if let Some(popup) = self.pending_popups.front_mut() {
-            let gap        = popup.gap.clone();
-            let dur        = gap.duration();
-            let title      = format!(
+        // ── Show idle-gap popup as immediate sub-viewport ─────────────────────
+        if let Some(ref mut popup) = self.idle_popup {
+            let gap = popup.gap.clone();
+            let title = format!(
                 "Idle {}  ({} → {})",
-                crate::utils::format_chrono_duration(&dur),
+                crate::utils::format_chrono_duration(&gap.duration()),
                 gap.gap_start.format("%H:%M"),
                 gap.gap_end.format("%H:%M"),
             );
-
-            let mut answered = false;
             ui.ctx().show_viewport_immediate(
                 egui::ViewportId::from_hash_of("idle_popup"),
                 egui::ViewportBuilder::default()
-                    .with_title(&title)
-                    .with_inner_size([520.0, 340.0])
+                    .with_title(title)
+                    .with_inner_size([520.0, 320.0])
                     .with_resizable(false)
                     .with_always_on_top(),
-                |ctx, _class| {
+                |ctx, _| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        crate::idle_popup::draw_idle_popup(ui, popup);
+                        draw_idle_popup(ui, popup);
                     });
-
-                    // Close viewport once answered (next frame).
                     if popup.answer.is_some() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        answered = true;
                     }
                 },
             );
+        }
 
-            if answered {
-                // Apply the answer to the database.
-                if let Some(popup_done) = self.pending_popups.pop_front() {
-                    use crate::idle_popup::IdleGapAnswer;
-                    use crate::models::WorktimeEntry;
-                    let mut db = self.database.lock().unwrap();
-                    match popup_done.answer.unwrap() {
-                        IdleGapAnswer::WorkTime => {
-                            db.insert_sorted(WorktimeEntry {
-                                start: popup_done.gap.gap_start,
-                                end:   popup_done.gap.gap_end,
-                                comments: String::new(),
-                            });
-                            println!("Idle gap {} → {} added as work time.",
-                                popup_done.gap.gap_start.format("%H:%M:%S"),
-                                popup_done.gap.gap_end.format("%H:%M:%S"));
-                        }
-                        IdleGapAnswer::Adjusted { work_start, work_end } => {
-                            db.insert_sorted(WorktimeEntry {
-                                start: work_start, end: work_end,
-                                comments: String::new(),
-                            });
-                            println!("Idle gap adjusted: {} → {} added as work time.",
-                                work_start.format("%H:%M:%S"), work_end.format("%H:%M:%S"));
-                        }
-                        IdleGapAnswer::Idle => {}
-                    }
-                    db.normalize(60);
+        // ── Commit popup answer → write to database ───────────────────────────
+        if let Some(answer) = self.idle_popup.as_ref().and_then(|p| p.answer.clone()) {
+            use crate::models::WorktimeEntry;
+            match answer {
+                IdleGapAnswer::WorkTime { gap_start, gap_end } => {
+                    self.db.insert_and_normalize(WorktimeEntry {
+                        start: gap_start, end: gap_end, comments: String::new(),
+                    });
+                }
+                IdleGapAnswer::Idle => {}
+                IdleGapAnswer::Adjusted { work_start, work_end } => {
+                    self.db.insert_and_normalize(WorktimeEntry {
+                        start: work_start, end: work_end, comments: String::new(),
+                    });
                 }
             }
+            self.idle_popup = None;
         }
 
         // ── Update tray badge ─────────────────────────────────────────────────
         self.update_tray_badge();
 
-        // ── Draw day view (fills the rest of the panel) ───────────────────────
+        // ── Day view ──────────────────────────────────────────────────────────
         egui::ScrollArea::vertical().show(ui, |ui| {
-            crate::day_view::draw_day_view(ui, &mut self.selected_date, &self.database);
+            crate::day_view::draw_day_view(ui, &mut self.selected_date, &self.db);
         });
-
-        // Keep the UI ticking for tray/channel events and popup interactions.
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
 impl MainApp {
-    fn show_window(&mut self, ctx: &egui::Context) {
-        self.window_visible = true;
+    fn show_window(&self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
-}
 
-// ── Tray badge rendering ──────────────────────────────────────────────────────
-
-impl MainApp {
     fn update_tray_badge(&mut self) {
-        let today = Local::now().date_naive();
-        let today_mins = {
-            let db = self.database.lock().unwrap();
-            db.get_day_sum(Local::now()).num_minutes() as u32
-        };
+        let today         = Local::now().date_naive();
+        let today_mins    = self.db.today_minutes();
+        let label         = format!("{}", today_mins / 60);
 
-        let label = badge_label(today_mins);
         if self.last_badge_label.as_deref() == Some(label.as_str()) {
             return;
         }
         self.last_badge_label = Some(label.clone());
 
         let target_mins = self.daily_target_hours * 60;
-        let (r, g, b): (u8, u8, u8) = if today_mins < 60 {
-            (80, 80, 80)
-        } else if today_mins < target_mins {
-            (210, 120, 0)
-        } else {
-            (40, 160, 80)
-        };
+        let (r, g, b): (u8, u8, u8) = if today_mins < 60 { (80, 80, 80) }
+            else if today_mins < target_mins { (210, 120, 0) }
+            else { (40, 160, 80) };
 
-        if let Some(ref mut tray) = self.tray {
-            let rgba    = render_badge_rgba(32, 32, &label, r, g, b);
-            let tooltip = format!("worktime — {} today", format_mins(today_mins));
-            if let Ok(new_icon) = tray_icon::Icon::from_rgba(rgba, 32, 32) {
-                let _ = tray.set_icon(Some(new_icon));
-            }
-            let _ = tray.set_tooltip(Some(tooltip));
+        // Store the badge update for the GTK tray thread to pick up.
+        let rgba    = render_badge_rgba(32, 32, &label, r, g, b);
+        let tooltip = format!("worktime — {}h {:02}m today", today_mins / 60, today_mins % 60);
+        if let Some(cell) = PENDING_BADGE.get() {
+            *cell.lock().unwrap() = Some(BadgePayload { rgba, tooltip });
         }
 
         if self.selected_date != today {
@@ -266,95 +240,48 @@ impl MainApp {
     }
 }
 
-fn make_tray_icon_rgba(w: u32, h: u32, r: u8, g: u8, b: u8) -> tray_icon::Icon {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[r, g, b, 255]);
-    }
-    tray_icon::Icon::from_rgba(rgba, w, h).expect("icon")
-}
+// ── Tray badge cross-thread update ────────────────────────────────────────────
+// The egui thread writes a pending badge here; the GTK tray thread polls it.
+
+pub(crate) struct BadgePayload { pub rgba: Vec<u8>, pub tooltip: String }
+
+pub(crate) static PENDING_BADGE: OnceLock<Mutex<Option<BadgePayload>>> = OnceLock::new();
 
 // ── Badge helpers ─────────────────────────────────────────────────────────────
 
-/// Badge label: whole hours worked. "0" when < 1h, "6" at 6h, "12" at 12h+.
-fn badge_label(total_mins: u32) -> String {
-    format!("{}", total_mins / 60)
-}
-
-fn format_mins(total_mins: u32) -> String {
-    let h = total_mins / 60;
-    let m = total_mins % 60;
-    if h == 0 { format!("{}m", m) } else { format!("{}h {:02}m", h, m) }
-}
-
-/// Render the badge into a 32×32 RGBA buffer.
-///
-/// Uses a 5×7 pixel bitmap font with 2× pixel scaling so each logical pixel
-/// maps to a 2×2 block of screen pixels — giving ~10px-wide digits on a 32×32
-/// icon, which is clearly legible in a system tray.
 fn render_badge_rgba(w: u32, h: u32, label: &str, bg_r: u8, bg_g: u8, bg_b: u8) -> Vec<u8> {
     let mut buf = vec![0u8; (w * h * 4) as usize];
-
-    // ── Fill background ───────────────────────────────────────────────────────
-    for py in 0..h {
-        for px in 0..w {
-            let idx = ((py * w + px) * 4) as usize;
-            buf[idx]     = bg_r;
-            buf[idx + 1] = bg_g;
-            buf[idx + 2] = bg_b;
-            buf[idx + 3] = 255;
-        }
-    }
-
-    // ── Render text with 2× pixel scaling ────────────────────────────────────
-    // Each glyph is 5 logical pixels wide × 7 tall.
-    // At scale=2: each glyph occupies 10×14 screen pixels, +2px gap = 12px/char.
-    let scale:   u32 = 2;
-    let glyph_w: u32 = 5;  // logical pixels wide
-    let glyph_h: u32 = 7;  // logical pixels tall
-    let gap:     u32 = 1;  // logical gap between chars
-    let char_count = label.chars().count() as u32;
-
-    if char_count == 0 { return buf; }
-    // Total scaled text width: N glyphs + (N-1) gaps, all scaled
-    let text_w_px = (char_count * (glyph_w + gap) - gap) * scale;
-    let text_h_px = glyph_h * scale;
-
-    // Centre in the icon
-    let start_x = ((w.saturating_sub(text_w_px)) / 2) as i32;
-    let start_y = ((h.saturating_sub(text_h_px)) / 2) as i32;
-
+    for py in 0..h { for px in 0..w {
+        let i = ((py * w + px) * 4) as usize;
+        buf[i] = bg_r; buf[i+1] = bg_g; buf[i+2] = bg_b; buf[i+3] = 255;
+    }}
+    let scale = 2u32; let gw = 5u32; let gh = 7u32; let gap = 1u32;
+    let n = label.chars().count() as u32;
+    if n == 0 { return buf; }
+    let tw = (n * (gw + gap) - gap) * scale;
+    let sx = ((w.saturating_sub(tw)) / 2) as i32;
+    let sy = ((h.saturating_sub(gh * scale)) / 2) as i32;
     for (i, ch) in label.chars().enumerate() {
         let glyph = char_bitmap_5x7(ch);
-        let char_x = start_x + (i as i32) * ((glyph_w + gap) * scale) as i32;
-
-        for (row, &row_bits) in glyph.iter().enumerate() {
-            for col in 0..glyph_w {
-                // MSB of the 5-bit row mask = leftmost column
-                if row_bits & (1 << (glyph_w - 1 - col)) != 0 {
-                    // Paint a scale×scale block
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            let px = char_x + (col * scale + dx) as i32;
-                            let py = start_y + (row as u32 * scale + dy) as i32;
-                            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
-                                let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                                buf[idx]     = 255;
-                                buf[idx + 1] = 255;
-                                buf[idx + 2] = 255;
-                                buf[idx + 3] = 255;
-                            }
+        let cx = sx + (i as i32) * ((gw + gap) * scale) as i32;
+        for (row, &bits) in glyph.iter().enumerate() {
+            for col in 0..gw {
+                if bits & (1 << (gw - 1 - col)) != 0 {
+                    for dy in 0..scale { for dx in 0..scale {
+                        let px = cx + (col * scale + dx) as i32;
+                        let py = sy + (row as u32 * scale + dy) as i32;
+                        if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                            let i = ((py as u32 * w + px as u32) * 4) as usize;
+                            buf[i]=255; buf[i+1]=255; buf[i+2]=255; buf[i+3]=255;
                         }
-                    }
+                    }}
                 }
             }
         }
     }
-
     buf
 }
 
-/// 5×7 pixel bitmap font, one byte per row (5 bits used, MSB = leftmost column).
 fn char_bitmap_5x7(ch: char) -> [u8; 7] {
     match ch {
         '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
