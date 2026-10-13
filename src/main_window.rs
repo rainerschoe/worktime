@@ -6,15 +6,31 @@
 //!   - Monitoring thread: idle detection, auto-save (monitoring.rs)
 //!
 //! Communication:
-//!   - Monitoring → UI:   mpsc channel of IdleGapInfo
-//!   - Popup:             rendered as immediate sub-viewport on the main thread
+//!   - Monitoring → UI:   mpsc channel of IdleGapInfo + `wake_ui()`
+//!   - Popup:             deferred sub-viewport with its own repaint cycle
 //!   - Tray → UI:         tray_icon event channels (try_recv each frame)
 
 use chrono::{Local, NaiveDate};
 use eframe::egui;
 use crate::database::DbHandle;
 use crate::idle_popup::{IdleGapInfo, IdleGapAnswer, IdlePopupState, draw_idle_popup};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ── Waking the UI thread from background threads ──────────────────────────────
+
+/// Set once the egui context exists (see `MainApp::new`).
+static UI_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// Ask the egui event loop to run a frame now.
+///
+/// Background threads must call this after pushing an idle-gap event, otherwise
+/// the event is only picked up on the next frame that happens for some other
+/// reason — which, when the main window is minimized, can be many seconds away.
+pub fn wake_ui() {
+    if let Some(ctx) = UI_CTX.get() {
+        ctx.request_repaint();
+    }
+}
 
 // ── Tray icon ─────────────────────────────────────────────────────────────────
 
@@ -80,8 +96,9 @@ pub struct MainApp {
     db:           DbHandle,
     /// Receives idle-gap events from the monitoring thread.
     gap_rx:       Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
-    /// Pending idle-gap popup, if any.
-    idle_popup:   Option<IdlePopupState>,
+    /// Pending idle-gap popup, if any.  Shared with the deferred viewport that
+    /// renders it and that commits the user's answer (see `show_idle_popup`).
+    idle_popup:   Option<Arc<Mutex<IdlePopupState>>>,
 
     selected_date:      NaiveDate,
     last_badge_label:   Option<String>,
@@ -93,8 +110,10 @@ impl MainApp {
         db: DbHandle,
         gap_rx: Option<std::sync::mpsc::Receiver<IdleGapInfo>>,
         daily_target_hours: u32,
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
     ) -> Self {
+        // Let background threads wake the event loop (idle-gap events).
+        let _ = UI_CTX.set(cc.egui_ctx.clone());
         spawn_tray_thread();
         Self {
             db,
@@ -144,56 +163,13 @@ impl eframe::App for MainApp {
                 // stack multiple windows.  (In practice only one gap fires at a
                 // time, but guard it anyway.)
                 if self.idle_popup.is_none() {
-                    self.idle_popup = Some(IdlePopupState::new(gap));
+                    self.idle_popup = Some(Arc::new(Mutex::new(IdlePopupState::new(gap))));
                 }
             }
         }
 
-        // ── Show idle-gap popup as immediate sub-viewport ─────────────────────
-        if let Some(ref mut popup) = self.idle_popup {
-            let gap = popup.gap.clone();
-            let title = format!(
-                "Idle {}  ({} → {})",
-                crate::utils::format_chrono_duration(&gap.duration()),
-                gap.gap_start.format("%H:%M"),
-                gap.gap_end.format("%H:%M"),
-            );
-            ui.ctx().show_viewport_immediate(
-                egui::ViewportId::from_hash_of("idle_popup"),
-                egui::ViewportBuilder::default()
-                    .with_title(title)
-                    .with_inner_size([520.0, 320.0])
-                    .with_resizable(false)
-                    .with_always_on_top(),
-                |ctx, _| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        draw_idle_popup(ui, popup);
-                    });
-                    if popup.answer.is_some() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                },
-            );
-        }
-
-        // ── Commit popup answer → write to database ───────────────────────────
-        if let Some(answer) = self.idle_popup.as_ref().and_then(|p| p.answer.clone()) {
-            use crate::models::WorktimeEntry;
-            match answer {
-                IdleGapAnswer::WorkTime { gap_start, gap_end } => {
-                    self.db.insert_and_normalize(WorktimeEntry {
-                        start: gap_start, end: gap_end, comments: String::new(),
-                    });
-                }
-                IdleGapAnswer::Idle => {}
-                IdleGapAnswer::Adjusted { work_start, work_end } => {
-                    self.db.insert_and_normalize(WorktimeEntry {
-                        start: work_start, end: work_end, comments: String::new(),
-                    });
-                }
-            }
-            self.idle_popup = None;
-        }
+        // ── Idle-gap popup ────────────────────────────────────────────────────
+        self.show_idle_popup(ui.ctx());
 
         // ── Update tray badge ─────────────────────────────────────────────────
         self.update_tray_badge();
@@ -206,6 +182,91 @@ impl eframe::App for MainApp {
 }
 
 impl MainApp {
+    /// Show the pending idle-gap popup as a **deferred** viewport.
+    ///
+    /// Why deferred and not `show_viewport_immediate`: an immediate viewport can
+    /// only be laid out, receive input and react while *this* (root) window runs
+    /// a frame — eframe bounces every event on an immediate viewport's window
+    /// into "repaint the parent window instead".  But the popup shows up exactly
+    /// when the main window is minimized to the tray (or obscured), and a
+    /// Wayland surface in that state gets frame callbacks only sporadically, so
+    /// winit emits `RedrawRequested` for the root only every few seconds.  The
+    /// popup then appeared to freeze: a click was not *processed* until the next
+    /// root frame, seconds later.
+    ///
+    /// A deferred viewport has its own repaint cycle driven by its own (visible,
+    /// focused) window, so it runs at full speed regardless of the root.  For the
+    /// same reason everything that must happen promptly — including the database
+    /// write — is done inside the popup's own callback; the root viewport is only
+    /// needed afterwards to drop the viewport and thereby close the window.
+    fn show_idle_popup(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.idle_popup.clone() else { return };
+
+        let (answered, gap) = {
+            let popup = state.lock().unwrap();
+            (popup.committed, popup.gap.clone())
+        };
+
+        // The popup already handled and committed the answer in its own pass:
+        // stop listing the viewport so eframe destroys the window.
+        if answered {
+            self.idle_popup = None;
+            return;
+        }
+
+        let title = format!(
+            "Idle {}  ({} → {})",
+            crate::utils::format_chrono_duration(&gap.duration()),
+            gap.gap_start.format("%H:%M"),
+            gap.gap_end.format("%H:%M"),
+        );
+
+        let db = self.db.clone();
+        ctx.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("idle_popup"),
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size([520.0, 320.0])
+                .with_resizable(false)
+                .with_always_on_top(),
+            move |ui, _class| {
+                let popup_ctx = ui.ctx().clone();
+                let mut popup = state.lock().unwrap();
+
+                // Closing the window counts as "it was all idle time".
+                if popup.answer.is_none()
+                    && popup_ctx.input(|i| i.viewport().close_requested())
+                {
+                    popup.answer = Some(IdleGapAnswer::Idle);
+                }
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    if popup.committed {
+                        // Answer is already in the database; we are only waiting
+                        // for the main window to run a frame and close us.
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            ui.heading("Saved ✔");
+                        });
+                        return;
+                    }
+                    draw_idle_popup(ui, &mut popup);
+                });
+
+                if let Some(answer) = popup.answer.clone() {
+                    if !popup.committed {
+                        popup.committed = true;
+                        commit_idle_answer(&db, answer);
+                        // Ask to close, and wake the root viewport so it drops
+                        // this viewport (which is what actually closes it).
+                        popup_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        popup_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
+            },
+        );
+    }
+
     fn show_window(&self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -236,6 +297,27 @@ impl MainApp {
 
         if self.selected_date != today {
             self.selected_date = today;
+        }
+    }
+}
+
+// ── Idle-gap answer → database ────────────────────────────────────────────────
+
+/// Write the user's answer to the database.  Called from the popup viewport's
+/// own pass, so it does not depend on the main window running a frame.
+fn commit_idle_answer(db: &DbHandle, answer: IdleGapAnswer) {
+    use crate::models::WorktimeEntry;
+    match answer {
+        IdleGapAnswer::WorkTime { gap_start, gap_end } => {
+            db.insert_and_normalize(WorktimeEntry {
+                start: gap_start, end: gap_end, comments: String::new(),
+            });
+        }
+        IdleGapAnswer::Idle => {}
+        IdleGapAnswer::Adjusted { work_start, work_end } => {
+            db.insert_and_normalize(WorktimeEntry {
+                start: work_start, end: work_end, comments: String::new(),
+            });
         }
     }
 }

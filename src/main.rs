@@ -93,8 +93,12 @@ fn main() {
             std::thread::spawn(move || {
                 if let Some(rx) = run_monitoring(db_bg, &cfg_bg) {
                     // Forward gaps from the monitoring channel to the UI channel.
+                    // `wake_ui` is required: without it the event loop only picks
+                    // the gap up on its next frame, which may be many seconds
+                    // away when the window is minimized.
                     for gap in rx {
                         let _ = gap_tx.send(gap);
+                        main_window::wake_ui();
                     }
                 }
             });
@@ -109,6 +113,7 @@ fn main() {
                         gap_start: now - chrono::Duration::hours(1),
                         gap_end:   now,
                     });
+                    main_window::wake_ui();
                 });
             }
 

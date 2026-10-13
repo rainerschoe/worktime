@@ -1,9 +1,11 @@
 //! Graphical popup asking the user whether an idle gap was actually work time.
 //!
-//! The popup is now rendered as an immediate sub-viewport from the main egui
-//! app, so it always runs on the main thread. The old `run_native`-based
-//! `ask_idle_gap` is kept for the `test_popup` binary but is no longer used
-//! by the main app.
+//! The popup is rendered as a *deferred* sub-viewport from the main egui app
+//! (see `main_window::MainApp::show_idle_popup`), so it runs on the main thread
+//! but has its own repaint cycle: it stays responsive even while the main
+//! window is minimized to the tray or obscured and therefore gets no frames
+//! from the compositor. The old `run_native`-based `ask_idle_gap` is kept for
+//! the `test_popup` binary but is no longer used by the main app.
 
 use chrono::{DateTime, Local, Duration, TimeZone};
 use eframe::egui;
@@ -39,21 +41,25 @@ impl IdleGapInfo {
 // ── Public viewport-based popup state ────────────────────────────────────────
 
 /// Mutable state for one pending idle-gap popup.
-/// Lives in `MainApp` and rendered each frame via `show_viewport_immediate`.
+/// Lives in `MainApp` behind an `Arc<Mutex<_>>`, shared with the deferred
+/// viewport that renders it.
 #[derive(Clone)]
 pub struct IdlePopupState {
     pub gap:        IdleGapInfo,
     pub work_start: DateTime<Local>,
     pub work_end:   DateTime<Local>,
-    /// Set when the user clicks a button — the main app drains this.
+    /// Set when the user clicks a button (or closes the popup window).
     pub answer:     Option<IdleGapAnswer>,
+    /// True once `answer` has been written to the database.  The popup repaints
+    /// itself after answering, so this keeps the write from happening twice.
+    pub committed:  bool,
 }
 
 impl IdlePopupState {
     pub fn new(gap: IdleGapInfo) -> Self {
         let work_start = gap.gap_start;
         let work_end   = gap.gap_end;
-        Self { gap, work_start, work_end, answer: None }
+        Self { gap, work_start, work_end, answer: None, committed: false }
     }
 }
 
